@@ -28,10 +28,11 @@ Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
 | `Enter` | Play the selected song, or the first track of the selected album / artist |
 | `space` | Play / pause (plays the selection if nothing is loaded) |
 | `n` / `p` | Next / previous track |
+| `z` | Toggle shuffle: next and auto-advance pick a random song from the current list, previous walks back through what was played |
 | `←` / `→` (or `,` / `.`) | Rewind / fast-forward 5 seconds |
-| `=` (or `+`) / `-` | Playback speed +1% / −1% (range −50% to +50%) |
+| `=` (or `+`) / `-` | Playback speed +1% / −1% (range 50% to 150%) |
 | `0` | Reset speed to 100% |
-| `v` | Vinyl & tape effects dialog (see below) |
+| `x` | FX: vinyl & tape effects dialog (see below) |
 | `e` | Equaliser & stereo dialog: off, 3-band or 7-band EQ, loudness, mono / stereo width |
 | `l` | Toggle loudness (bass and treble lift for quiet listening) |
 | `f` | Reveal the current file in Finder / Explorer / your file manager |
@@ -40,9 +41,13 @@ Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
 
 Speed changes are done by resampling, so pitch shifts with speed.
 
+MP3 files that iTunes or QuickTime wrapped in a RIFF/WAVE header (a WAV file whose payload is MP3 frames) are detected and the MP3 payload is decoded directly.
+
+If a file will not play, `vinyl --probe <file>` opens it the same way playback does and prints the decoder's view of it (format, duration, how much audio the first five seconds yield) or the error.
+
 ## Vinyl & tape effects
 
-Press `v` to open the effects dialog. Pick a mode with `←`/`→` on the Mode row, move between rows with `↑`/`↓`, and adjust a value with `←`/`→` (±5) or `+`/`-` (±1). `0` resets the row, `Esc` closes. Changes apply immediately to whatever is playing and are remembered in `~/.vinyl-fx.json`.
+Press `x` to open the effects dialog. Pick a mode with `←`/`→` on the Mode row, move between rows with `↑`/`↓`, and adjust a value with `←`/`→` (±5) or `+`/`-` (±1). `0` resets the row, `Esc` closes. Changes apply immediately to whatever is playing and are remembered in `~/.vinyl-fx.json`.
 
 | Mode | Controls | Character |
 | --- | --- | --- |
@@ -57,3 +62,17 @@ Tape age lowers the bandwidth, raises hiss, adds extra wow, and introduces occas
 Press `e` for the equaliser. The 3-band mode has a low shelf at 200 Hz, a mid peak at 1 kHz and a high shelf at 4 kHz; the 7-band mode is a graphic EQ at 60, 150, 400, 1k, 2.5k, 6k and 15k Hz. Each band ranges ±12 dB (`←`/`→` for 1 dB, `PgUp`/`PgDn` for 3 dB, `0` to flatten). The last row toggles loudness, which `l` also toggles from the main screen. A soft limiter after the EQ keeps boosts from clipping.
 
 The Stereo row offers Normal, Mono, and Width. Width uses mid/side processing: the side signal (L−R) is scaled from 0% to 200%, where 100% leaves the image untouched and higher values push it wider (`←`/`→` for 5%, `PgUp`/`PgDn` for 15%). EQ, loudness and stereo settings are saved alongside the tape settings.
+
+## Versions
+
+### v1
+
+- initial version
+
+### v1.1
+
+- added shuffle
+- changed fx/speed keys
+- added --probe
+- fix for old files encoded with RIFF and MP3
+

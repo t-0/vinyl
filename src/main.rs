@@ -12,6 +12,21 @@ use std::time::{Duration, Instant};
 const SEEK_SECS: f64 = 5.0;
 fn main() -> Result<()> {
     let config = config::load()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--probe") {
+        let Some(path) = args.get(1) else {
+            eprintln!("usage: vinyl --probe <audio file>");
+            std::process::exit(2);
+        };
+        match audio::probe(std::path::Path::new(path), app::load_fx(&config)) {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("probe failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, App::new(config));
     ratatui::restore();
@@ -106,10 +121,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('0') => app.reset_speed(),
         KeyCode::Enter => app.activate_cursor(),
         KeyCode::Char('/') => app.open_search(),
-        KeyCode::Char('v') => app.fx_open = true,
+        KeyCode::Char('x') => app.fx_open = true,
         KeyCode::Char('e') => app.eq_open = true,
         KeyCode::Char('o') => app.open_sort(),
         KeyCode::Char('l') => app.toggle_loudness(),
+        KeyCode::Char('z') => app.toggle_shuffle(),
         KeyCode::Char('f') => app.reveal_in_finder(),
         KeyCode::Char('i') => app.start_index(true),
         _ => {}
@@ -133,7 +149,7 @@ fn handle_search_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 }
 fn handle_fx_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('v') | KeyCode::Char('q') => app.close_fx(),
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('x') | KeyCode::Char('q') => app.close_fx(),
         KeyCode::Up | KeyCode::Char('k') => app.fx_move(-1),
         KeyCode::Down | KeyCode::Char('j') => app.fx_move(1),
         KeyCode::Left | KeyCode::Char('h') => app.fx_adjust(-5),

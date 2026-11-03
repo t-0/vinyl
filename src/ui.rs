@@ -407,9 +407,9 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
     let pct = app.speed_pct;
     let label = Line::from(vec![
         Span::styled("Speed   ", Style::default().fg(DIM)),
-        Span::styled(format!("{pct:+}%"), Style::default().fg(ACCENT).bold()),
+        Span::styled(format!("{}%", 100 + pct), Style::default().fg(ACCENT).bold()),
         Span::styled(
-            format!("  ({:.2}x)   +/- 1%, 0 resets", app.speed()),
+            format!("  ({:.2}x)   +/- 1%, 0 resets to 100%", app.speed()),
             Style::default().fg(DIM),
         ),
     ]);
@@ -421,7 +421,7 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
     let track_w = w - 10;
     let knob = ((pct + 50) as f64 / 100.0 * (track_w - 1) as f64).round() as usize;
     let center = track_w / 2;
-    let mut spans = vec![Span::styled("-50% ", Style::default().fg(DIM))];
+    let mut spans = vec![Span::styled(" 50% ", Style::default().fg(DIM))];
     for i in 0..track_w {
         if i == knob {
             spans.push(Span::styled("●", Style::default().fg(ACCENT).bold()));
@@ -431,7 +431,7 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
             spans.push(Span::styled("─", Style::default().fg(DIM)));
         }
     }
-    spans.push(Span::styled(" +50%", Style::default().fg(DIM)));
+    spans.push(Span::styled(" 150%", Style::default().fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(spans)), slider_area);
 }
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -443,27 +443,28 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ))
     } else {
         let keys = [
-            ("/", "search"),
-            ("o", "sort"),
-            ("v", "vinyl/tape"),
-            ("e", "eq"),
-            ("l", "loudness"),
-            ("↑/↓ pgup/pgdn", "select"),
-            ("⏎", "play"),
-            ("+/-", "speed"),
-            ("space", "play/pause"),
-            ("n/p", "next/prev"),
-            ("←/→", "rew/ff"),
+            ("/", "Search"),
+            ("o", "Sort"),
+            ("x", "FX"),
+            ("e", "EQ"),
+            ("l", "Loudness"),
+            ("↑/↓ pgup/pgdn", "Select"),
+            ("⏎", "Play"),
+            ("+/-", "Speed"),
+            ("space", "Play/Pause"),
+            ("n/p", "Track"),
+            ("z", if app.shuffle { "Shuffle on" } else { "Shuffle" }),
+            ("←/→", "Scan"),
             (
                 "f",
                 if cfg!(target_os = "macos") {
-                    "finder"
+                    "Finder"
                 } else {
-                    "show file"
+                    "Show File"
                 },
             ),
-            ("i", "reindex"),
-            ("q", "quit"),
+            ("i", "Reindex"),
+            ("q", "Quit"),
         ];
         let mut spans = Vec::new();
         for (k, d) in keys {
@@ -528,7 +529,7 @@ fn draw_search_box(f: &mut Frame, area: Rect, app: &App) {
 fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
     let p = app.fx;
     let detail = match p.mode {
-        Mode::Off => String::from("Off   (v to configure)"),
+        Mode::Off => String::from("Off   (x to configure)"),
         Mode::Vinyl => format!(
             "{}   scratch {}  distortion {}",
             p.mode.label(),
@@ -551,7 +552,7 @@ fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Effects ", Style::default().fg(DIM)),
+            Span::styled("FX      ", Style::default().fg(DIM)),
             Span::styled(detail, style),
         ])),
         area,
@@ -574,7 +575,7 @@ fn draw_fx_box(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " Vinyl & Tape ",
+            " FX ",
             Style::default().fg(ACCENT).bold(),
         ));
     let inner = block.inner(rect);

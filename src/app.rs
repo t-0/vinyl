@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
     Songs,
@@ -62,6 +62,9 @@ pub struct App {
     pending_play: Option<usize>,
     pub offsets: [usize; 3],
     pub speed_pct: i32,
+    pub shuffle: bool,
+    shuffle_rng: u64,
+    shuffle_history: Vec<usize>,
     pub audio: Option<Audio>,
     pub audio_error: Option<String>,
     pub analyser: Analyser,
@@ -108,6 +111,13 @@ impl App {
             pending_play: None,
             offsets: [0; 3],
             speed_pct: 0,
+            shuffle: false,
+            shuffle_rng: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1,
+            shuffle_history: Vec::new(),
             audio,
             audio_error,
             analyser: Analyser::new(),
@@ -460,7 +470,17 @@ impl App {
                 Ok(()) => self.status.clear(),
                 Err(e) => {
                     self.playing = None;
-                    self.set_status(format!("cannot play: {e:#}"));
+                    let mut msg = format!("cannot play: {e:#}");
+                    if cfg!(target_os = "macos")
+                        && e.chain().any(|c| {
+                            c.downcast_ref::<std::io::Error>()
+                                .map(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                                .unwrap_or(false)
+                        })
+                    {
+                        msg.push_str(" — macOS is blocking this terminal: System Settings → Privacy & Security → Media & Apple Music (and Files and Folders)");
+                    }
+                    self.set_status(msg);
                 }
             },
             None => self.set_status(format!(
@@ -484,10 +504,57 @@ impl App {
         }
     }
     pub fn step_track(&mut self, delta: i64) {
+        if self.shuffle && self.view_songs.len() > 1 {
+            self.step_shuffle(delta);
+            return;
+        }
         let Some(pos) = self.anchor_pos() else { return };
         let n = self.view_songs.len() as i64;
         let next = (pos as i64 + delta).rem_euclid(n) as usize;
         self.play_index(self.view_songs[next]);
+    }
+    fn next_random(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.shuffle_rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.shuffle_rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn step_shuffle(&mut self, delta: i64) {
+        if delta < 0 {
+            while let Some(prev) = self.shuffle_history.pop() {
+                if Some(prev) != self.playing && self.tracks.get(prev).is_some() {
+                    self.play_index(prev);
+                    return;
+                }
+            }
+            return;
+        }
+        let n = self.view_songs.len();
+        let r = (self.next_random() % n as u64) as usize;
+        let mut pick = self.view_songs[r];
+        if Some(pick) == self.playing {
+            let pos = self.song_view_pos(pick).unwrap_or(0);
+            pick = self.view_songs[(pos + 1) % n];
+        }
+        if let Some(cur) = self.playing {
+            self.shuffle_history.push(cur);
+            if self.shuffle_history.len() > 500 {
+                self.shuffle_history.remove(0);
+            }
+        }
+        self.play_index(pick);
+    }
+    pub fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        self.shuffle_history.clear();
+        self.set_status(if self.shuffle {
+            "Shuffle on"
+        } else {
+            "Shuffle off"
+        });
     }
     pub fn move_cursor(&mut self, delta: i64) {
         let (cur, len) = match self.section {
@@ -798,7 +865,7 @@ fn reveal_command(path: &std::path::Path) -> Command {
 fn fx_file(config: &Config) -> std::path::PathBuf {
     config.index_file.with_file_name(".vinyl-fx.json")
 }
-fn load_fx(config: &Config) -> FxParams {
+pub fn load_fx(config: &Config) -> FxParams {
     std::fs::read_to_string(fx_file(config))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
