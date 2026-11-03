@@ -272,6 +272,17 @@ impl App {
                     )
                 });
             }
+            SortKey::ArtistTrack => {
+                let tracks = &self.tracks;
+                order.sort_by_cached_key(|&i| {
+                    (
+                        tracks[i].artist.to_lowercase(),
+                        tracks[i].title.to_lowercase(),
+                        tracks[i].album.to_lowercase(),
+                        i,
+                    )
+                });
+            }
         }
         self.sort_order = order;
     }
@@ -346,13 +357,15 @@ impl App {
                     .any(|&m| m)
             })
             .collect();
-        match self.playing {
-            Some(i) => self.sync_cursors_to(i),
-            None => {
-                self.cursor_song = 0;
-                self.cursor_album = 0;
-                self.cursor_artist = 0;
-            }
+        // Start every filtered view at the top, unless the playing track is in it.
+        self.cursor_song = 0;
+        self.cursor_album = 0;
+        self.cursor_artist = 0;
+        self.offsets = [0; 3];
+        if let Some(i) = self.playing
+            && self.song_view_pos(i).is_some()
+        {
+            self.sync_cursors_to(i);
         }
     }
     pub fn open_search(&mut self) {
@@ -609,7 +622,13 @@ impl App {
             Mode::Off => {}
             Mode::Vinyl => rows.extend([FxRow::Scratch, FxRow::Distortion]),
             Mode::ReelToReel | Mode::Cassette => {
-                rows.extend([FxRow::Age, FxRow::Saturation, FxRow::Wow, FxRow::Flutter])
+                rows.extend([
+                    FxRow::Age,
+                    FxRow::Hiss,
+                    FxRow::Saturation,
+                    FxRow::Wow,
+                    FxRow::Flutter,
+                ])
             }
         }
         rows
@@ -623,6 +642,7 @@ impl App {
             FxRow::Saturation => self.fx.saturation,
             FxRow::Wow => self.fx.wow,
             FxRow::Flutter => self.fx.flutter,
+            FxRow::Hiss => self.fx.hiss,
         }
     }
     pub fn fx_move(&mut self, delta: i64) {
@@ -651,6 +671,7 @@ impl App {
             FxRow::Saturation => bump(&mut self.fx.saturation),
             FxRow::Wow => bump(&mut self.fx.wow),
             FxRow::Flutter => bump(&mut self.fx.flutter),
+            FxRow::Hiss => bump(&mut self.fx.hiss),
         }
         self.push_fx();
     }
@@ -668,6 +689,7 @@ impl App {
             FxRow::Saturation => self.fx.saturation = def.saturation,
             FxRow::Wow => self.fx.wow = def.wow,
             FxRow::Flutter => self.fx.flutter = def.flutter,
+            FxRow::Hiss => self.fx.hiss = def.hiss,
         }
         self.push_fx();
     }
@@ -798,14 +820,21 @@ pub enum SortKey {
     Artist,
     Track,
     Album,
+    ArtistTrack,
 }
 impl SortKey {
-    pub const ALL: [SortKey; 3] = [SortKey::Artist, SortKey::Track, SortKey::Album];
+    pub const ALL: [SortKey; 4] = [
+        SortKey::Artist,
+        SortKey::Track,
+        SortKey::Album,
+        SortKey::ArtistTrack,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Artist => "Artist",
             SortKey::Track => "Track",
             SortKey::Album => "Album",
+            SortKey::ArtistTrack => "Artist/Track",
         }
     }
     pub fn describe(self) -> &'static str {
@@ -813,6 +842,7 @@ impl SortKey {
             SortKey::Artist => "artist, then album, then track number",
             SortKey::Track => "track title, then artist",
             SortKey::Album => "album, then artist, then track number",
+            SortKey::ArtistTrack => "artist, then track title, then album",
         }
     }
 }
@@ -833,6 +863,7 @@ pub enum FxRow {
     Saturation,
     Wow,
     Flutter,
+    Hiss,
 }
 impl FxRow {
     pub fn label(self) -> &'static str {
@@ -844,6 +875,7 @@ impl FxRow {
             FxRow::Saturation => "Saturation",
             FxRow::Wow => "Wow",
             FxRow::Flutter => "Flutter",
+            FxRow::Hiss => "Hiss",
         }
     }
 }

@@ -174,7 +174,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
                 let marker = if Some(i) == playing { "▶ " } else { "  " };
                 let dur = fmt_dur(t.duration_secs);
                 let (left, right) = match app.sort {
-                    SortKey::Artist => (
+                    SortKey::Artist | SortKey::ArtistTrack => (
                         format!("{marker}{} — {}", t.artist, t.title),
                         format!("{}  {dur}", t.album),
                     ),
@@ -529,7 +529,7 @@ fn draw_search_box(f: &mut Frame, area: Rect, app: &App) {
 fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
     let p = app.fx;
     let detail = match p.mode {
-        Mode::Off => String::from("Off   (x to configure)"),
+        Mode::Off => String::from("Off"),
         Mode::Vinyl => format!(
             "{}   scratch {}  distortion {}",
             p.mode.label(),
@@ -537,9 +537,10 @@ fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
             p.distortion
         ),
         _ => format!(
-            "{}   age {}  sat {}  wow {}  flt {}",
+            "{}   age {}  hiss {}  sat {}  wow {}  flt {}",
             p.mode.label(),
             p.age,
+            p.hiss,
             p.saturation,
             p.wow,
             p.flutter
@@ -788,7 +789,7 @@ fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 fn draw_sort_box(f: &mut Frame, area: Rect, app: &App) {
-    let w = area.width.clamp(30, 56);
+    let w = area.width.clamp(30, 64);
     let h = (SortKey::ALL.len() as u16 + 4).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 3;
@@ -819,7 +820,7 @@ fn draw_sort_box(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{:<8}", key.label()), st),
+            Span::styled(format!("{marker}{:<14}", key.label()), st),
             Span::styled(
                 if current { "● " } else { "  " },
                 Style::default().fg(ACCENT),
@@ -829,7 +830,7 @@ fn draw_sort_box(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "↑/↓ select  enter apply  a/t/b shortcuts  esc cancel",
+        "↑/↓ select  enter apply  a/t/b/r shortcuts  esc cancel",
         Style::default().fg(DIM),
     ));
     f.render_widget(Paragraph::new(lines), inner);

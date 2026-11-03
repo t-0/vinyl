@@ -112,6 +112,9 @@ pub const WIDTH_MAX: u8 = 200;
 fn default_width() -> u8 {
     150
 }
+fn default_hiss() -> u8 {
+    50
+}
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct FxParams {
     pub mode: Mode,
@@ -121,6 +124,8 @@ pub struct FxParams {
     pub saturation: u8,
     pub wow: u8,
     pub flutter: u8,
+    #[serde(default = "default_hiss")]
+    pub hiss: u8,
     #[serde(default)]
     pub eq: EqParams,
     #[serde(default)]
@@ -140,6 +145,7 @@ impl Default for FxParams {
             saturation: 35,
             wow: 20,
             flutter: 15,
+            hiss: default_hiss(),
             eq: EqParams::default(),
             loudness: false,
             stereo: StereoMode::Normal,
@@ -395,8 +401,9 @@ impl<S: Source> Fx<S> {
                 let sat = pct(p.saturation) + if cassette { 0.1 } else { 0.0 };
                 d.drive = 1.0 + 5.0 * sat;
                 d.makeup = 1.0 / d.drive.powf(0.65);
+                // Hiss 50 matches the old fixed level; 0 is silent, 100 is double.
                 let base_hiss = if cassette { 0.0035 } else { 0.0010 };
-                d.hiss = base_hiss * (1.0 + 3.0 * age);
+                d.hiss = base_hiss * 2.0 * pct(p.hiss) * (1.0 + 3.0 * age);
                 let wf_scale = if cassette { 1.5 } else { 0.6 };
                 d.wow_depth = (0.005 * pct(p.wow) + 0.0008 * age) * wf_scale;
                 d.flutter_depth = 0.00024 * pct(p.flutter) * wf_scale;

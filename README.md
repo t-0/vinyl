@@ -23,7 +23,7 @@ Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
 | --- | --- |
 | `s` / `a` / `r` | Show the song / album / artist list |
 | `/` | Search: type text matched against artist, album and title, then `Enter`. An empty search shows everything again; `Esc` cancels |
-| `o` | Sort the song list by artist, track title, or album (`a`/`t`/`b` are shortcuts inside the popup). Next/previous follow the chosen order |
+| `o` | Sort the song list by artist, track title, album, or artist then track title (`a`/`t`/`b`/`r` are shortcuts inside the popup). Next/previous follow the chosen order |
 | `↑` / `↓` (or `k` / `j`) | Move the selection; `PgUp` / `PgDn` move a page, `Home` / `End` jump to the top / bottom |
 | `Enter` | Play the selected song, or the first track of the selected album / artist |
 | `space` | Play / pause (plays the selection if nothing is loaded) |
@@ -52,10 +52,10 @@ Press `x` to open the effects dialog. Pick a mode with `←`/`→` on the Mode r
 | Mode | Controls | Character |
 | --- | --- | --- |
 | Vinyl | Scratch, Distortion | random crackle and pops, surface noise, warm asymmetric distortion, 16 kHz roll-off |
-| Reel-to-reel | Tape age, Saturation, Wow, Flutter | wide bandwidth, light hiss, gentle tanh saturation, slow wow |
-| Cassette | Tape age, Saturation, Wow, Flutter | 12 kHz bandwidth, more hiss, stronger wow and flutter |
+| Reel-to-reel | Tape age, Hiss, Saturation, Wow, Flutter | wide bandwidth, light hiss, gentle tanh saturation, slow wow |
+| Cassette | Tape age, Hiss, Saturation, Wow, Flutter | 12 kHz bandwidth, more hiss, stronger wow and flutter |
 
-Tape age lowers the bandwidth, raises hiss, adds extra wow, and introduces occasional dropouts.
+Tape age lowers the bandwidth, raises hiss, adds extra wow, and introduces occasional dropouts. Hiss sets the base noise level independently: 0 is silent, 50 is the natural level for the mode, and age still scales it.
 
 ## Equaliser and loudness
 
@@ -76,3 +76,9 @@ The Stereo row offers Normal, Mono, and Width. Width uses mid/side processing: t
 - added --probe
 - fix for old files encoded with RIFF and MP3
 
+### v1.2
+
+- added artist/track sort order
+- correct list view when applying search
+- added tape hiss parameter
+- simplify hints on now playing

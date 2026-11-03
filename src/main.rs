@@ -95,6 +95,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.sort_row = 2;
                 app.apply_sort()
             }
+            KeyCode::Char('r') => {
+                app.sort_row = 3;
+                app.apply_sort()
+            }
             _ => {}
         }
         return;
