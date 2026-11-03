@@ -63,6 +63,16 @@ Press `e` for the equaliser. The 3-band mode has a low shelf at 200 Hz, a mid pe
 
 The Stereo row offers Normal, Mono, and Width. Width uses mid/side processing: the side signal (L−R) is scaled from 0% to 200%, where 100% leaves the image untouched and higher values push it wider (`←`/`→` for 5%, `PgUp`/`PgDn` for 15%). EQ, loudness and stereo settings are saved alongside the tape settings.
 
+## Testing
+
+`cargo test` runs the unit tests: library grouping, search and sort behaviour, shuffle, speed, FX parameter handling, the MP3-in-WAV unwrapping and slice reader, and a guard that the FX chain runs faster than real time in a debug build. None of them touch an audio device.
+
+Longer soak and performance tests are marked `#[ignore]` and are meant for a release build:
+
+    cargo test --release -- --ignored --nocapture
+
+They push 200k random operations through the app state against an 8k-track library, stream an hour of audio through the FX chain with parameters randomised twice a second, decode a ten-minute file with a thousand random seeks, and time search and sort over 20k tracks. Each prints its throughput.
+
 ## Versions
 
 ### v1
@@ -82,3 +92,7 @@ The Stereo row offers Normal, Mono, and Width. Width uses mid/side processing: t
 - correct list view when applying search
 - added tape hiss parameter
 - simplify hints on now playing
+
+### v1.4
+
+- added tests including soak tests

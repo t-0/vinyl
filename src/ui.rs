@@ -407,7 +407,10 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
     let pct = app.speed_pct;
     let label = Line::from(vec![
         Span::styled("Speed   ", Style::default().fg(DIM)),
-        Span::styled(format!("{}%", 100 + pct), Style::default().fg(ACCENT).bold()),
+        Span::styled(
+            format!("{}%", 100 + pct),
+            Style::default().fg(ACCENT).bold(),
+        ),
         Span::styled(
             format!("  ({:.2}x)   +/- 1%, 0 resets to 100%", app.speed()),
             Style::default().fg(DIM),
@@ -575,10 +578,7 @@ fn draw_fx_box(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            " FX ",
-            Style::default().fg(ACCENT).bold(),
-        ));
+        .title(Span::styled(" FX ", Style::default().fg(ACCENT).bold()));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let mut lines: Vec<Line> = Vec::new();

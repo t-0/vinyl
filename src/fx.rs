@@ -401,7 +401,6 @@ impl<S: Source> Fx<S> {
                 let sat = pct(p.saturation) + if cassette { 0.1 } else { 0.0 };
                 d.drive = 1.0 + 5.0 * sat;
                 d.makeup = 1.0 / d.drive.powf(0.65);
-                // Hiss 50 matches the old fixed level; 0 is silent, 100 is double.
                 let base_hiss = if cassette { 0.0035 } else { 0.0010 };
                 d.hiss = base_hiss * 2.0 * pct(p.hiss) * (1.0 + 3.0 * age);
                 let wf_scale = if cassette { 1.5 } else { 0.6 };
@@ -622,6 +621,251 @@ mod tests {
         );
         let shared = Arc::new(Mutex::new(params));
         Fx::new(src, shared, None).collect()
+    }
+    fn run_signal(params: FxParams, data: Vec<f32>, sr: u32) -> Vec<f32> {
+        let src = SamplesBuffer::new(NonZero::new(2).unwrap(), NonZero::new(sr).unwrap(), data);
+        Fx::new(src, Arc::new(Mutex::new(params)), None).collect()
+    }
+    fn rms(v: &[f32]) -> f32 {
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+    }
+    fn clean_tape(mode: Mode, hiss: u8) -> FxParams {
+        FxParams {
+            mode,
+            age: 0,
+            saturation: 0,
+            wow: 0,
+            flutter: 0,
+            hiss,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn hiss_parameter_scales_tape_noise() {
+        for mode in [Mode::ReelToReel, Mode::Cassette] {
+            let silence = vec![0.0f32; 44_100 * 2];
+            let quiet = run_signal(clean_tape(mode, 0), silence.clone(), 44_100);
+            let mid = run_signal(clean_tape(mode, 50), silence.clone(), 44_100);
+            let loud = run_signal(clean_tape(mode, 100), silence, 44_100);
+            let (q, m, l) = (rms(&quiet), rms(&mid), rms(&loud));
+            assert!(q < 1e-6, "{mode:?}: hiss 0 should be silent, rms {q}");
+            assert!(m > 1e-4, "{mode:?}: hiss 50 should be audible, rms {m}");
+            let ratio = l / m;
+            assert!(
+                (1.6..2.4).contains(&ratio),
+                "{mode:?}: hiss 100 should be about twice hiss 50, got {ratio}"
+            );
+        }
+    }
+    #[test]
+    fn cassette_hisses_more_than_reel_at_same_setting() {
+        let silence = vec![0.0f32; 44_100 * 2];
+        let reel = rms(&run_signal(
+            clean_tape(Mode::ReelToReel, 50),
+            silence.clone(),
+            44_100,
+        ));
+        let cass = rms(&run_signal(clean_tape(Mode::Cassette, 50), silence, 44_100));
+        assert!(cass > reel * 2.0, "cassette {cass} vs reel {reel}");
+    }
+    #[test]
+    fn age_still_raises_hiss() {
+        let silence = vec![0.0f32; 44_100 * 2];
+        let young = rms(&run_signal(
+            clean_tape(Mode::ReelToReel, 50),
+            silence.clone(),
+            44_100,
+        ));
+        let old = rms(&run_signal(
+            FxParams {
+                age: 100,
+                ..clean_tape(Mode::ReelToReel, 50)
+            },
+            silence,
+            44_100,
+        ));
+        assert!(old > young * 2.0, "old {old} vs young {young}");
+    }
+    #[test]
+    fn legacy_settings_without_hiss_load_at_default() {
+        let json = r#"{"mode":"Cassette","scratch":30,"distortion":15,"age":25,"saturation":35,"wow":20,"flutter":15}"#;
+        let p: FxParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.hiss, FxParams::default().hiss);
+        assert_eq!(p.mode, Mode::Cassette);
+        let round: FxParams = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(round, p);
+    }
+    #[test]
+    fn vinyl_scratch_zero_is_free_of_noise_and_pops() {
+        let silence = vec![0.0f32; 44_100 * 2];
+        let out = run_signal(
+            FxParams {
+                mode: Mode::Vinyl,
+                scratch: 0,
+                distortion: 0,
+                ..Default::default()
+            },
+            silence,
+            44_100,
+        );
+        assert!(rms(&out) < 1e-6);
+    }
+    #[test]
+    fn mono_input_is_supported() {
+        let data = sine(22_050);
+        let src = SamplesBuffer::new(
+            NonZero::new(1).unwrap(),
+            NonZero::new(22_050).unwrap(),
+            data,
+        );
+        let p = FxParams {
+            mode: Mode::Cassette,
+            ..Default::default()
+        };
+        let out: Vec<f32> = Fx::new(src, Arc::new(Mutex::new(p)), None).collect();
+        assert_eq!(out.len(), 22_050);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+    #[test]
+    fn parameter_changes_apply_while_streaming() {
+        let shared = Arc::new(Mutex::new(FxParams {
+            mode: Mode::Off,
+            ..Default::default()
+        }));
+        let data = vec![0.0f32; 44_100 * 2];
+        let src = SamplesBuffer::new(
+            NonZero::new(2).unwrap(),
+            NonZero::new(44_100).unwrap(),
+            data,
+        );
+        let mut fx = Fx::new(src, shared.clone(), None);
+        let first: Vec<f32> = fx.by_ref().take(44_100).collect();
+        assert!(rms(&first) < 1e-6);
+        shared.lock().unwrap().mode = Mode::Cassette;
+        shared.lock().unwrap().hiss = 100;
+        let rest: Vec<f32> = fx.collect();
+        assert!(
+            rms(&rest[4096..]) > 1e-4,
+            "hiss should appear after the switch"
+        );
+    }
+    #[test]
+    fn fx_chain_runs_faster_than_realtime() {
+        let secs = 20;
+        let data = sine(44_100 * 2 * secs);
+        for mode in [Mode::Vinyl, Mode::ReelToReel, Mode::Cassette] {
+            let p = FxParams {
+                mode,
+                eq: EqParams {
+                    mode: EqMode::Seven,
+                    ..Default::default()
+                },
+                loudness: true,
+                stereo: StereoMode::Width,
+                ..Default::default()
+            };
+            let src = SamplesBuffer::new(
+                NonZero::new(2).unwrap(),
+                NonZero::new(44_100).unwrap(),
+                data.clone(),
+            );
+            let t = std::time::Instant::now();
+            let n = Fx::new(src, Arc::new(Mutex::new(p)), None).fold(0usize, |n, v| {
+                assert!(v.is_finite());
+                n + 1
+            });
+            let el = t.elapsed().as_secs_f64();
+            assert_eq!(n, data.len());
+            eprintln!(
+                "fx {mode:?}: {secs}s of audio in {el:.3}s ({:.1}x realtime)",
+                secs as f64 / el
+            );
+            assert!(
+                el < secs as f64 / 3.0,
+                "{mode:?} ran at under 3x realtime: {el:.2}s"
+            );
+        }
+    }
+    #[test]
+    #[ignore]
+    fn soak_fx_hour_with_random_parameter_changes() {
+        let sr = 44_100u32;
+        let secs = 3600usize;
+        let shared = Arc::new(Mutex::new(FxParams::default()));
+        let block = sine(sr as usize * 2);
+        let data = block.iter().copied().cycle().take(sr as usize * 2 * secs);
+        struct Cycle<I: Iterator<Item = f32>>(I);
+        impl<I: Iterator<Item = f32>> Iterator for Cycle<I> {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> {
+                self.0.next()
+            }
+        }
+        impl<I: Iterator<Item = f32>> Source for Cycle<I> {
+            fn current_span_len(&self) -> Option<usize> {
+                None
+            }
+            fn channels(&self) -> ChannelCount {
+                NonZero::new(2).unwrap()
+            }
+            fn sample_rate(&self) -> SampleRate {
+                NonZero::new(44_100).unwrap()
+            }
+            fn total_duration(&self) -> Option<Duration> {
+                None
+            }
+        }
+        let mut fx = Fx::new(Cycle(data), shared.clone(), None);
+        let mut rng = 0x5eed_1234u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let half_second = sr as usize;
+        let t = std::time::Instant::now();
+        let mut peak = 0f32;
+        let mut total = 0usize;
+        for _ in 0..secs * 2 {
+            {
+                let mut p = shared.lock().unwrap();
+                p.mode = Mode::ALL[(next() % Mode::ALL.len() as u64) as usize];
+                p.scratch = (next() % 101) as u8;
+                p.distortion = (next() % 101) as u8;
+                p.age = (next() % 101) as u8;
+                p.saturation = (next() % 101) as u8;
+                p.wow = (next() % 101) as u8;
+                p.flutter = (next() % 101) as u8;
+                p.hiss = (next() % 101) as u8;
+                p.loudness = next() % 2 == 0;
+                p.eq.mode = match next() % 3 {
+                    0 => EqMode::Off,
+                    1 => EqMode::Three,
+                    _ => EqMode::Seven,
+                };
+                for b in p.eq.seven.iter_mut() {
+                    *b = (next() % 25) as i8 - 12;
+                }
+                for b in p.eq.three.iter_mut() {
+                    *b = (next() % 25) as i8 - 12;
+                }
+                p.stereo = StereoMode::ALL[(next() % 3) as usize];
+                p.width = (next() % (WIDTH_MAX as u64 + 1)) as u8;
+            }
+            for v in fx.by_ref().take(half_second) {
+                assert!(v.is_finite(), "non-finite sample after {total} samples");
+                peak = peak.max(v.abs());
+                total += 1;
+            }
+        }
+        let el = t.elapsed().as_secs_f64();
+        eprintln!(
+            "soak fx: {secs}s processed in {el:.1}s ({:.1}x realtime), peak {peak:.3}",
+            secs as f64 / el
+        );
+        assert_eq!(total, sr as usize * 2 * secs);
+        assert!(peak < 2.0, "peak {peak}");
     }
     #[test]
     fn off_is_identity() {
