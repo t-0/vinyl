@@ -27,6 +27,10 @@ pub struct Track {
     pub disc: Option<u32>,
     pub duration_secs: f64,
     pub filetype: String,
+    /// Auto-normalisation gain in dB, measured the first time the track is
+    /// played with normalisation on (see `audio::measure_gain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f32>,
 }
 impl Track {
     pub fn group_artist(&self) -> &str {
@@ -107,6 +111,7 @@ fn read_track(path: &Path, mtime: u64, size: u64) -> Track {
         disc: None,
         duration_secs: 0.0,
         filetype: ext.clone(),
+        gain_db: None,
     };
     let tagged = match lofty::read_from_path(path) {
         Ok(f) => f,
@@ -166,6 +171,13 @@ fn read_track(path: &Path, mtime: u64, size: u64) -> Track {
     }
     t
 }
+pub fn save(index_file: &Path, tracks: &[Track]) -> Result<()> {
+    let json = serde_json::to_string(&Index {
+        tracks: tracks.to_vec(),
+    })?;
+    fs::write(index_file, json)
+        .with_context(|| format!("writing index to {}", index_file.display()))
+}
 pub fn build(root: PathBuf, index_file: PathBuf, force: bool, tx: Sender<IndexMsg>) {
     let result = (|| -> Result<Scan> {
         let old = if force {
@@ -223,11 +235,7 @@ pub fn build(root: PathBuf, index_file: PathBuf, force: bool, tx: Sender<IndexMs
             }
         }
         tracks.sort_by_cached_key(|t| t.sort_key());
-        let json = serde_json::to_string(&Index {
-            tracks: tracks.clone(),
-        })?;
-        fs::write(&index_file, json)
-            .with_context(|| format!("writing index to {}", index_file.display()))?;
+        save(&index_file, &tracks)?;
         Ok(Scan { tracks, unreadable })
     })();
     let _ = tx.send(IndexMsg::Done(result));

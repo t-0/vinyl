@@ -50,6 +50,18 @@ impl EqMode {
     }
 }
 pub const EQ_RANGE_DB: i8 = 12;
+/// Preamp gain range in dB. It sits in front of the whole chain, so a boost
+/// drives the tape saturation and vinyl distortion harder and a cut backs
+/// them off.
+pub const PREAMP_MIN_DB: i8 = -24;
+pub const PREAMP_MAX_DB: i8 = 12;
+/// Where auto-normalisation tries to put a track's gated RMS level, in dBFS,
+/// and how far it is allowed to move a track to get there.
+pub const NORMALIZE_TARGET_DB: f32 = -18.0;
+pub const NORMALIZE_RANGE_DB: (f32, f32) = (-18.0, 12.0);
+/// Time constant of the ramp between preamp gains, so a measurement that
+/// arrives mid-track fades in rather than steps.
+const GAIN_RAMP_SECS: f32 = 0.3;
 pub const THREE_BANDS: [(&str, f32); 3] = [("Low", 200.0), ("Mid", 1000.0), ("High", 4000.0)];
 pub const SEVEN_BANDS: [f32; 7] = [60.0, 150.0, 400.0, 1000.0, 2500.0, 6000.0, 15000.0];
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
@@ -115,7 +127,7 @@ fn default_width() -> u8 {
 fn default_hiss() -> u8 {
     50
 }
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct FxParams {
     pub mode: Mode,
     pub scratch: u8,
@@ -126,6 +138,16 @@ pub struct FxParams {
     pub flutter: u8,
     #[serde(default = "default_hiss")]
     pub hiss: u8,
+    /// Gain in dB applied before everything else.
+    #[serde(default)]
+    pub preamp: i8,
+    /// Add each track's measured normalisation gain to the preamp.
+    #[serde(default)]
+    pub auto_normalize: bool,
+    /// Normalisation gain for the current track in dB, set by the app per
+    /// track; it is state, not a setting, so it is never saved.
+    #[serde(skip)]
+    pub track_gain: f32,
     #[serde(default)]
     pub eq: EqParams,
     #[serde(default)]
@@ -134,6 +156,22 @@ pub struct FxParams {
     pub stereo: StereoMode,
     #[serde(default = "default_width")]
     pub width: u8,
+}
+impl FxParams {
+    /// User preamp plus the track's normalisation gain when that is on, in dB.
+    pub fn effective_preamp_db(&self) -> f32 {
+        let user = self.preamp.clamp(PREAMP_MIN_DB, PREAMP_MAX_DB) as f32;
+        if self.auto_normalize {
+            user + self
+                .track_gain
+                .clamp(NORMALIZE_RANGE_DB.0, NORMALIZE_RANGE_DB.1)
+        } else {
+            user
+        }
+    }
+    fn preamp_linear(&self) -> f32 {
+        10f32.powf(self.effective_preamp_db() / 20.0)
+    }
 }
 impl Default for FxParams {
     fn default() -> Self {
@@ -146,6 +184,9 @@ impl Default for FxParams {
             wow: 20,
             flutter: 15,
             hiss: default_hiss(),
+            preamp: 0,
+            auto_normalize: false,
+            track_gain: 0.0,
             eq: EqParams::default(),
             loudness: false,
             stereo: StereoMode::Normal,
@@ -276,6 +317,8 @@ fn soft_limit(y: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Derived {
     mode: Mode,
+    /// Linear preamp gain; 1.0 is 0 dB.
+    preamp: f32,
     drive: f32,
     bias: f32,
     makeup: f32,
@@ -307,6 +350,9 @@ pub struct Fx<S: Source> {
     frame_delay: f32,
     frame_pop: f32,
     frame_gain: f32,
+    /// Current preamp gain, ramping toward `d.preamp`.
+    gain: f32,
+    gain_coef: f32,
     pop_env: f32,
     pop_decay: f32,
     lfo: [f32; 4],
@@ -330,6 +376,7 @@ impl<S: Source> Fx<S> {
                 loud: [Biquad::default(); 2],
             })
             .collect();
+        let gain = params.lock().map(|p| p.preamp_linear()).unwrap_or(1.0);
         let mut fx = Self {
             inner,
             params,
@@ -346,6 +393,8 @@ impl<S: Source> Fx<S> {
             frame_delay: BASE_DELAY_SECS,
             frame_pop: 0.0,
             frame_gain: 1.0,
+            gain,
+            gain_coef: 1.0 - (-1.0 / (sr * GAIN_RAMP_SECS)).exp(),
             pop_env: 0.0,
             pop_decay: (-1.0 / (sr * 0.0012)).exp(),
             lfo: [0.0; 4],
@@ -412,6 +461,7 @@ impl<S: Source> Fx<S> {
                 d.cutoff = base_cut * (1.0 - 0.6 * age);
             }
         }
+        d.preamp = p.preamp_linear();
         let rate_scale = 44_100.0 / self.sr;
         d.pop_prob *= rate_scale;
         d.dropout_prob *= rate_scale;
@@ -447,6 +497,12 @@ impl<S: Source> Fx<S> {
     }
     fn advance_frame(&mut self) {
         let d = self.d;
+        if self.gain != d.preamp {
+            self.gain += (d.preamp - self.gain) * self.gain_coef;
+            if (d.preamp - self.gain).abs() < 1e-4 {
+                self.gain = d.preamp;
+            }
+        }
         let dt = 1.0 / self.sr;
         let two_pi = 2.0 * std::f32::consts::PI;
         if d.mode.is_tape() {
@@ -491,10 +547,12 @@ impl<S: Source> Fx<S> {
     fn process(&mut self, x: Sample, ch: usize) -> Sample {
         let d = self.d;
         let shape = d.eq_bands > 0 || d.loudness;
-        if d.mode == Mode::Off && !shape {
+        let gain = self.gain;
+        let boost = gain > 1.0;
+        if d.mode == Mode::Off && !shape && gain == 1.0 {
             return x;
         }
-        let mut y = x;
+        let mut y = x * gain;
         let sr = self.sr;
         let c = &mut self.chans[ch];
         if d.mode == Mode::Off {
@@ -530,6 +588,8 @@ impl<S: Source> Fx<S> {
                 let bass = c.loud[0].process(y * 0.75);
                 y = c.loud[1].process(bass);
             }
+        }
+        if shape || boost {
             y = soft_limit(y);
         }
         y
@@ -838,6 +898,9 @@ mod tests {
                 p.wow = (next() % 101) as u8;
                 p.flutter = (next() % 101) as u8;
                 p.hiss = (next() % 101) as u8;
+                p.preamp = (next() % 37) as i8 + PREAMP_MIN_DB;
+                p.auto_normalize = next() % 2 == 0;
+                p.track_gain = (next() % 400) as f32 / 10.0 - 24.0;
                 p.loudness = next() % 2 == 0;
                 p.eq.mode = match next() % 3 {
                     0 => EqMode::Off,
@@ -874,6 +937,111 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(out, sine(44_100));
+    }
+    #[test]
+    fn preamp_scales_the_signal_before_the_chain() {
+        let clean = run(FxParams::default());
+        let quiet = run(FxParams {
+            preamp: -6,
+            ..Default::default()
+        });
+        let ratio = rms(&quiet) / rms(&clean);
+        assert!((ratio - 0.501).abs() < 0.01, "-6 dB gave ratio {ratio}");
+        let loud = run(FxParams {
+            preamp: 12,
+            ..Default::default()
+        });
+        let peak = loud.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            peak <= 1.0 && peak > 0.9,
+            "+12 dB peak {peak} should be limited"
+        );
+        // A boost into tape saturation changes the shape, not just the level.
+        let tape = |pre| {
+            run(FxParams {
+                mode: Mode::ReelToReel,
+                hiss: 0,
+                wow: 0,
+                flutter: 0,
+                age: 0,
+                preamp: pre,
+                ..Default::default()
+            })
+        };
+        let (a, b) = (tape(0), tape(12));
+        let (ra, rb) = (rms(&a), rms(&b));
+        assert!(rb > ra, "boost should be louder: {ra} vs {rb}");
+        assert!(
+            rb / ra < 3.98,
+            "saturation should compress a +12 dB boost: {}",
+            rb / ra
+        );
+        let muted = run(FxParams {
+            preamp: PREAMP_MIN_DB,
+            ..Default::default()
+        });
+        let ratio = rms(&muted) / rms(&clean);
+        assert!((ratio - 0.063).abs() < 0.005, "-24 dB gave ratio {ratio}");
+    }
+    #[test]
+    fn normalisation_adds_to_preamp_and_ramps() {
+        let p = FxParams {
+            preamp: 6,
+            auto_normalize: true,
+            track_gain: -12.0,
+            ..Default::default()
+        };
+        assert_eq!(p.effective_preamp_db(), -6.0);
+        assert_eq!(
+            FxParams {
+                auto_normalize: false,
+                ..p
+            }
+            .effective_preamp_db(),
+            6.0
+        );
+        assert_eq!(
+            FxParams {
+                track_gain: 40.0,
+                ..p
+            }
+            .effective_preamp_db(),
+            6.0 + NORMALIZE_RANGE_DB.1
+        );
+        // A gain that changes while streaming fades over a fraction of a
+        // second instead of stepping.
+        let shared = Arc::new(Mutex::new(FxParams {
+            auto_normalize: true,
+            ..Default::default()
+        }));
+        let data = vec![0.5f32; 44_100 * 2 * 3];
+        let src = SamplesBuffer::new(
+            NonZero::new(2).unwrap(),
+            NonZero::new(44_100).unwrap(),
+            data,
+        );
+        let mut fx = Fx::new(src, shared.clone(), None);
+        let first: Vec<f32> = fx.by_ref().take(2000).collect();
+        assert!(first.iter().all(|&v| v == 0.5));
+        shared.lock().unwrap().track_gain = -6.0;
+        let rest: Vec<f32> = fx.collect();
+        let at = |ms: usize| rest[ms * 44_100 * 2 / 1000 + 512];
+        assert!(
+            at(5) < 0.5 && at(5) > 0.45,
+            "ramp should have started: {}",
+            at(5)
+        );
+        assert!(at(100) > at(300), "ramp should keep falling");
+        let last = *rest.last().unwrap();
+        assert!(
+            (last - 0.2505).abs() < 0.002,
+            "should settle at -6 dB: {last}"
+        );
+        let steps = rest
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(steps < 0.002, "largest step {steps} is a click");
     }
     #[test]
     fn modes_stay_finite_and_bounded() {

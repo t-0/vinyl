@@ -15,6 +15,16 @@ On first run `~/.vinyl` is created with:
 
 Set `music.home` to the folder holding your music; every audio file at or under it is indexed. The index is cached in `~/.vinyl-index.json` (override with `index.file = ...`) and refreshed on each start, re-reading tags only for files whose size or modification time changed. `VINYL_CONFIG=/path/to/file` points at a different config file.
 
+### Audio editor
+
+    audio.editor = /Applications/Audacity.app
+    audio.editor.mode = gui
+
+`audio.editor` is the command that `E` runs on the selected track. Write `{file}` where the track path should go (it may appear more than once, and inside a longer argument such as `--in={file}`); if the command has no `{file}`, the path is appended as the last argument. Quote arguments that contain spaces, e.g. `"Logic Pro.app"`. On macOS a `.app` bundle is launched through `open -a`. `audio.editor.mode` says how the editor behaves:
+
+- `gui` (default): the editor is a desktop app. vinyl starts it and carries on playing.
+- `cli`: the editor runs in this terminal. vinyl pauses playback, hands the screen over, waits for the editor to exit, then redraws, resumes playback and refreshes the index so edited tags or lengths show up. Your selection and scroll position are kept.
+
 Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
 
 ## Keys
@@ -33,9 +43,10 @@ Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
 | `=` (or `+`) / `-` | Playback speed +1% / −1% (range 50% to 150%) |
 | `0` | Reset speed to 100% |
 | `x` | FX: vinyl & tape effects dialog (see below) |
-| `e` | Equaliser & stereo dialog: off, 3-band or 7-band EQ, loudness, mono / stereo width |
+| `e` | Equaliser & stereo dialog: preamp, auto-normalise, off, 3-band or 7-band EQ, loudness, mono / stereo width |
 | `l` | Toggle loudness (bass and treble lift for quiet listening) |
 | `f` | Reveal the current file in Finder / Explorer / your file manager |
+| `E` | Open the selected track in your audio editor (see `audio.editor` above; the key is only shown once one is configured) |
 | `i` | Rebuild the index from scratch |
 | `q` | Quit |
 
@@ -59,7 +70,11 @@ Tape age lowers the bandwidth, raises hiss, adds extra wow, and introduces occas
 
 ## Equaliser and loudness
 
-Press `e` for the equaliser. The 3-band mode has a low shelf at 200 Hz, a mid peak at 1 kHz and a high shelf at 4 kHz; the 7-band mode is a graphic EQ at 60, 150, 400, 1k, 2.5k, 6k and 15k Hz. Each band ranges ±12 dB (`←`/`→` for 1 dB, `PgUp`/`PgDn` for 3 dB, `0` to flatten). The last row toggles loudness, which `l` also toggles from the main screen. A soft limiter after the EQ keeps boosts from clipping.
+Press `e` for the equaliser. The first row is the preamp: a gain from −24 dB to +12 dB applied before everything else (tape and vinyl effects, EQ, loudness, stereo), so it sets how hard the signal drives the tape saturation and vinyl distortion as well as the overall level. `←`/`→` move it 1 dB, `PgUp`/`PgDn` 3 dB, `0` returns it to 0 dB. A boost is soft-limited so it cannot clip.
+
+The Normalise row below it levels tracks automatically. When it is on, the first time a track plays vinyl decodes it in the background and measures its loudness (RMS over 400 ms blocks, ignoring near-silent blocks), then adds whatever gain brings it to −18 dBFS, between −18 dB and +12 dB, to the preamp. The measurement takes a moment on first play, fades in when it arrives, and is stored in the index so later plays start at the right level; a file that changes is measured again. The Preamp row shows the track's gain next to your own setting, and `vinyl --probe <file>` prints it too.
+
+The 3-band mode has a low shelf at 200 Hz, a mid peak at 1 kHz and a high shelf at 4 kHz; the 7-band mode is a graphic EQ at 60, 150, 400, 1k, 2.5k, 6k and 15k Hz. Each band ranges ±12 dB (`←`/`→` for 1 dB, `PgUp`/`PgDn` for 3 dB, `0` to flatten). The last row toggles loudness, which `l` also toggles from the main screen. A soft limiter after the EQ keeps boosts from clipping.
 
 The Stereo row offers Normal, Mono, and Width. Width uses mid/side processing: the side signal (L−R) is scaled from 0% to 200%, where 100% leaves the image untouched and higher values push it wider (`←`/`→` for 5%, `PgUp`/`PgDn` for 15%). EQ, loudness and stereo settings are saved alongside the tape settings.
 
@@ -98,5 +113,14 @@ They push 200k random operations through the app state against an 8k-track libra
 - added tests including soak tests
 
 ### v1.5
+
 - error message leakage - added screen refresh and removing screen pollution (anything the audio stack writes to stderr now lands in `~/.vinyl.log` instead of on the screen)
 - center jumped-to tracks
+
+### v1.6
+
+- added `audio.editor` and `audio.editor.mode` settings and the `E` key to open the selected track in an audio editor
+- the file path under the analyser is shown relative to `music.home`
+- added a preamp (−24 dB to +12 dB) ahead of the FX chain, in the equaliser dialog
+- added auto-normalisation: per-track level measured on first play, cached in the index, added to the preamp
+- flag unknown configuration keys

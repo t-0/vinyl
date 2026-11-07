@@ -1,6 +1,8 @@
 use crate::audio::Audio;
-use crate::config::{Config, display_path};
-use crate::fx::{EQ_RANGE_DB, EqMode, FxParams, Mode, StereoMode, WIDTH_MAX};
+use crate::config::{Config, EditorMode, display_path};
+use crate::fx::{
+    EQ_RANGE_DB, EqMode, FxParams, Mode, PREAMP_MAX_DB, PREAMP_MIN_DB, StereoMode, WIDTH_MAX,
+};
 use crate::index::{self, IndexMsg, Track};
 use crate::spectrum::Analyser;
 use anyhow::Result;
@@ -39,6 +41,14 @@ pub struct Artist {
     pub track_start: usize,
     pub track_end: usize,
 }
+/// What the three list cursors were on, by identity rather than index, so
+/// they can be put back after the track list is rebuilt.
+struct ViewState {
+    song: Option<std::path::PathBuf>,
+    album: Option<(String, String)>,
+    artist: Option<String>,
+    offsets: [usize; 3],
+}
 pub struct App {
     pub config: Config,
     pub tracks: Vec<Track>,
@@ -70,6 +80,9 @@ pub struct App {
     shuffle_history: Vec<usize>,
     pub audio: Option<Audio>,
     pub audio_error: Option<String>,
+    /// A background level measurement for auto-normalisation: which track,
+    /// and the channel its result arrives on.
+    measuring: Option<(usize, Receiver<Result<f32>>)>,
     pub analyser: Analyser,
     pub fx: FxParams,
     pub fx_open: bool,
@@ -82,6 +95,9 @@ pub struct App {
     pub indexing: Option<(usize, usize)>,
     pub page_size: usize,
     index_rx: Option<Receiver<IndexMsg>>,
+    /// A terminal audio editor waiting to be run by the main loop, which has
+    /// to hand the screen over first (see `main::run_editor`).
+    pub pending_editor: Option<(String, Command)>,
     pub should_quit: bool,
 }
 impl App {
@@ -134,6 +150,7 @@ impl App {
             shuffle_history: Vec::new(),
             audio,
             audio_error,
+            measuring: None,
             analyser: Analyser::new(),
             fx,
             fx_open: false,
@@ -146,6 +163,7 @@ impl App {
             indexing: None,
             page_size: 10,
             index_rx: None,
+            pending_editor: None,
             should_quit: false,
         }
     }
@@ -215,6 +233,39 @@ impl App {
             .playing
             .and_then(|i| self.tracks.get(i))
             .map(|t| t.path.clone());
+        // A re-index (after the editor, or `i`) should not move the user's
+        // selection or scroll: remember what each cursor is on.
+        let keep = (!self.tracks.is_empty()).then(|| ViewState {
+            song: self
+                .view_songs
+                .get(self.cursor_song)
+                .map(|&i| self.tracks[i].path.clone()),
+            album: self
+                .view_albums
+                .get(self.cursor_album)
+                .map(|&a| (self.albums[a].artist.clone(), self.albums[a].name.clone())),
+            artist: self
+                .view_artists
+                .get(self.cursor_artist)
+                .map(|&r| self.artists[r].name.clone()),
+            offsets: self.offsets,
+        });
+        // Keep levels measured since the index file was last read, as long
+        // as the file itself has not changed.
+        let measured: std::collections::HashMap<&std::path::Path, (u64, u64, f32)> = self
+            .tracks
+            .iter()
+            .filter_map(|t| t.gain_db.map(|g| (t.path.as_path(), (t.mtime, t.size, g))))
+            .collect();
+        let mut tracks = tracks;
+        for t in tracks.iter_mut().filter(|t| t.gain_db.is_none()) {
+            if let Some(&(mtime, size, g)) = measured.get(t.path.as_path())
+                && t.mtime == mtime
+                && t.size == size
+            {
+                t.gain_db = Some(g);
+            }
+        }
         self.tracks = tracks;
         self.albums.clear();
         self.artists.clear();
@@ -259,6 +310,36 @@ impl App {
         self.playing = playing_path.and_then(|p| self.tracks.iter().position(|t| t.path == p));
         self.rebuild_sort_order();
         self.apply_search();
+        if let Some(keep) = keep {
+            self.restore_view(keep);
+        }
+    }
+    fn restore_view(&mut self, keep: ViewState) {
+        if let Some(p) = keep.song
+            && let Some(i) = self.tracks.iter().position(|t| t.path == p)
+            && let Some(pos) = self.song_view_pos(i)
+        {
+            self.cursor_song = pos;
+        }
+        if let Some((artist, name)) = keep.album
+            && let Some(a) = self
+                .albums
+                .iter()
+                .position(|al| al.artist == artist && al.name == name)
+            && self.view_albums.binary_search(&a).is_ok()
+        {
+            self.cursor_album = Self::view_pos(&self.view_albums, a);
+        }
+        if let Some(name) = keep.artist
+            && let Some(r) = self.artists.iter().position(|ar| ar.name == name)
+            && self.view_artists.binary_search(&r).is_ok()
+        {
+            self.cursor_artist = Self::view_pos(&self.view_artists, r);
+        }
+        // The lists are drawn with these offsets clamped so the cursor stays
+        // visible, so a stale offset is harmless.
+        self.offsets = keep.offsets;
+        self.recenter = [false; 3];
     }
     fn rebuild_sort_order(&mut self) {
         let mut order: Vec<usize> = (0..self.tracks.len()).collect();
@@ -490,6 +571,9 @@ impl App {
         };
         let path = track.path.clone();
         let speed = self.speed();
+        // The FX chain reads its gain when the source is built, so the
+        // track's normalisation gain has to be in place before `load`.
+        self.sync_track_gain();
         match self.audio.as_mut() {
             Some(audio) => match audio.load(&path, speed) {
                 Ok(()) => self.status.clear(),
@@ -628,6 +712,65 @@ impl App {
             Err(e) => self.set_status(format!("could not open file manager: {e}")),
         }
     }
+    /// `E`: opens the selected track in the configured audio editor. A GUI
+    /// editor is started and left alone; a CLI one is queued for the main
+    /// loop, which gives it the terminal and waits.
+    pub fn edit_in_editor(&mut self) {
+        let Some(words) = self.config.audio_editor.clone() else {
+            self.set_status("no audio editor: set audio.editor in ~/.vinyl");
+            return;
+        };
+        let idx = self.cursor_track().or(self.playing);
+        let Some(t) = idx.and_then(|i| self.tracks.get(i)) else {
+            return;
+        };
+        let path = t.path.clone();
+        let name = std::path::Path::new(words[0].trim_end_matches('/'))
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| words[0].clone());
+        let mut cmd = editor_command(&words, &path);
+        match self.config.audio_editor_mode {
+            EditorMode::Gui => {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                match cmd.spawn() {
+                    Ok(_) => self.set_status(format!(
+                        "opened {} in {name}",
+                        self.config.library_path(&path)
+                    )),
+                    Err(e) => self.set_status(format!("could not start {name}: {e}")),
+                }
+            }
+            EditorMode::Cli => {
+                cmd.stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                self.pending_editor = Some((name, cmd));
+            }
+        }
+    }
+    /// Called by the main loop once a CLI editor has exited and the UI is
+    /// back on screen.
+    pub fn editor_finished(
+        &mut self,
+        program: &str,
+        result: std::io::Result<std::process::ExitStatus>,
+    ) {
+        match result {
+            Ok(st) if st.success() => {
+                self.set_status(format!("{program} finished"));
+                // Tags or length may have changed: pick that up without
+                // rereading everything.
+                if self.index_rx.is_none() {
+                    self.start_index(false);
+                }
+            }
+            Ok(st) => self.set_status(format!("{program} exited with {st}")),
+            Err(e) => self.set_status(format!("could not start {program}: {e}")),
+        }
+    }
     pub fn fx_rows(&self) -> Vec<FxRow> {
         let mut rows = vec![FxRow::Mode];
         match self.fx.mode {
@@ -718,7 +861,7 @@ impl App {
         }
     }
     pub fn eq_rows(&self) -> Vec<EqRow> {
-        let mut rows = vec![EqRow::Mode];
+        let mut rows = vec![EqRow::Preamp, EqRow::Normalize, EqRow::Mode];
         rows.extend((0..self.fx.eq.mode.bands()).map(EqRow::Band));
         rows.push(EqRow::Loudness);
         rows.push(EqRow::Stereo);
@@ -738,6 +881,12 @@ impl App {
         };
         let step = if delta < 0 { -1 } else { 1 };
         match row {
+            EqRow::Preamp => {
+                self.fx.preamp = (self.fx.preamp as i32 + delta)
+                    .clamp(PREAMP_MIN_DB as i32, PREAMP_MAX_DB as i32)
+                    as i8
+            }
+            EqRow::Normalize => self.set_normalize(!self.fx.auto_normalize),
             EqRow::Mode => {
                 let i = EqMode::ALL
                     .iter()
@@ -773,6 +922,8 @@ impl App {
             return;
         };
         match row {
+            EqRow::Preamp => self.fx.preamp = 0,
+            EqRow::Normalize => self.set_normalize(false),
             EqRow::Mode => self.fx.eq.mode = EqMode::Off,
             EqRow::Band(b) => {
                 if let Some(g) = self.fx.eq.gain_mut(b) {
@@ -786,9 +937,77 @@ impl App {
         self.eq_row = self.eq_row.min(self.eq_rows().len() - 1);
         self.push_fx();
     }
+    fn set_normalize(&mut self, on: bool) {
+        self.fx.auto_normalize = on;
+        self.sync_track_gain();
+    }
+    /// What the Preamp row should say about normalisation: the gain in use,
+    /// or that it is still being measured.
+    pub fn normalize_state(&self) -> NormalizeState {
+        if !self.fx.auto_normalize {
+            return NormalizeState::Off;
+        }
+        match self.playing.and_then(|i| self.tracks.get(i)) {
+            Some(t) => match t.gain_db {
+                Some(g) => NormalizeState::Gain(g),
+                None => NormalizeState::Measuring,
+            },
+            None => NormalizeState::Idle,
+        }
+    }
     pub fn close_eq(&mut self) {
         self.eq_open = false;
         self.save_settings();
+    }
+    /// Points the FX chain at the playing track's normalisation gain (0 dB
+    /// while unknown) and starts measuring it if needed.
+    fn sync_track_gain(&mut self) {
+        let playing = self
+            .playing
+            .and_then(|i| self.tracks.get(i).map(|t| (i, t.gain_db)));
+        self.fx.track_gain = match playing {
+            Some((_, Some(g))) if self.fx.auto_normalize => g,
+            _ => 0.0,
+        };
+        self.push_fx();
+        if let Some((i, None)) = playing
+            && self.fx.auto_normalize
+            && self.measuring.as_ref().map(|(m, _)| *m) != Some(i)
+        {
+            let path = self.tracks[i].path.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(crate::audio::measure_gain(&path));
+            });
+            self.measuring = Some((i, rx));
+        }
+    }
+    pub fn poll_measurement(&mut self) {
+        let Some((i, rx)) = &self.measuring else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        let i = *i;
+        self.measuring = None;
+        match result {
+            Ok(g) => {
+                if let Some(t) = self.tracks.get_mut(i) {
+                    t.gain_db = Some(g);
+                }
+                if self.playing == Some(i) {
+                    self.sync_track_gain();
+                }
+                // Remember it for next time, off the UI thread.
+                let file = self.config.index_file.clone();
+                let tracks = self.tracks.clone();
+                thread::spawn(move || {
+                    let _ = index::save(&file, &tracks);
+                });
+            }
+            Err(e) => self.set_status(format!("could not measure level: {e:#}")),
+        }
     }
     pub fn toggle_loudness(&mut self) {
         self.fx.loudness = !self.fx.loudness;
@@ -843,6 +1062,7 @@ impl App {
     }
     pub fn tick(&mut self) -> Result<()> {
         self.poll_index();
+        self.poll_measurement();
         if self.pending_play.is_none()
             && let (Some(_), Some(audio)) = (self.playing, &self.audio)
             && audio.finished()
@@ -884,8 +1104,18 @@ impl SortKey {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum NormalizeState {
+    Off,
+    /// On, but nothing is playing.
+    Idle,
+    Measuring,
+    Gain(f32),
+}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EqRow {
+    Preamp,
+    Normalize,
     Mode,
     Band(usize),
     Loudness,
@@ -937,6 +1167,37 @@ fn reveal_command(path: &std::path::Path) -> Command {
         .stderr(Stdio::null());
     c
 }
+/// Builds the editor invocation: `words` is the configured command split
+/// into program and arguments. Every `{file}` in the arguments is replaced
+/// by the track path; without one the path goes last. On macOS a `.app`
+/// bundle is started through `open -a`, which is how bundles are launched;
+/// `open` returns as soon as the app has the file, so that only makes sense
+/// in GUI mode.
+const FILE_PLACEHOLDER: &str = "{file}";
+fn editor_command(words: &[String], path: &std::path::Path) -> Command {
+    let program = words[0].trim_end_matches('/');
+    let file = path.to_string_lossy();
+    let mut args: Vec<String> = words[1..]
+        .iter()
+        .map(|w| w.replace(FILE_PLACEHOLDER, &file))
+        .collect();
+    if !words[1..].iter().any(|w| w.contains(FILE_PLACEHOLDER)) {
+        args.push(file.into_owned());
+    }
+    let mut c = if cfg!(target_os = "macos") && program.ends_with(".app") {
+        let mut c = Command::new("open");
+        c.arg("-a").arg(program).args(&args);
+        c
+    } else {
+        let mut c = Command::new(program);
+        c.args(&args);
+        c
+    };
+    if let Some(dir) = path.parent() {
+        c.current_dir(dir);
+    }
+    c
+}
 fn fx_file(config: &Config) -> std::path::PathBuf {
     config.index_file.with_file_name(".vinyl-fx.json")
 }
@@ -962,6 +1223,8 @@ mod tests {
         Config {
             music_home: dir.clone(),
             index_file: dir.join("index.json"),
+            audio_editor: None,
+            audio_editor_mode: EditorMode::Gui,
         }
     }
     fn track(artist: &str, album: &str, title: &str, n: u32) -> Track {
@@ -978,7 +1241,88 @@ mod tests {
             disc: None,
             duration_secs: 180.0,
             filetype: "mp3".into(),
+            gain_db: None,
         }
+    }
+    fn args_of(c: &Command) -> Vec<String> {
+        c.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+    #[test]
+    fn editor_file_goes_last_unless_placed() {
+        let p = std::path::Path::new("/m/a b/x.mp3");
+        let w = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let c = editor_command(&w("ed --v"), p);
+        assert_eq!(c.get_program(), "ed");
+        assert_eq!(args_of(&c), ["--v", "/m/a b/x.mp3"]);
+        let c = editor_command(&w("ed --in={file} --out={file}.bak last"), p);
+        assert_eq!(
+            args_of(&c),
+            ["--in=/m/a b/x.mp3", "--out=/m/a b/x.mp3.bak", "last"]
+        );
+        let c = editor_command(&w("ed {file}"), p);
+        assert_eq!(args_of(&c), ["/m/a b/x.mp3"]);
+    }
+    #[test]
+    fn measured_gain_survives_reindex_and_feeds_preamp() {
+        let mut app = app_with("gain", library());
+        app.tracks[3].gain_db = Some(-4.5);
+        let path = app.tracks[3].path.clone();
+        app.set_tracks(library());
+        let t = app.tracks.iter().find(|t| t.path == path).unwrap();
+        assert_eq!(t.gain_db, Some(-4.5));
+        let mut changed = library();
+        changed.iter_mut().find(|t| t.path == path).unwrap().size = 2;
+        app.set_tracks(changed);
+        let t = app.tracks.iter().find(|t| t.path == path).unwrap();
+        assert_eq!(t.gain_db, None, "a changed file needs a new measurement");
+        // The gain only reaches the FX chain while normalisation is on and
+        // that track is playing.
+        app.tracks
+            .iter_mut()
+            .find(|t| t.path == path)
+            .unwrap()
+            .gain_db = Some(-4.5);
+        let idx = app.tracks.iter().position(|t| t.path == path).unwrap();
+        app.playing = Some(idx);
+        app.sync_track_gain();
+        assert_eq!(app.fx.track_gain, 0.0);
+        assert!(matches!(app.normalize_state(), NormalizeState::Off));
+        app.set_normalize(true);
+        assert_eq!(app.fx.track_gain, -4.5);
+        assert!(app.measuring.is_none());
+        assert!(matches!(app.normalize_state(), NormalizeState::Gain(g) if g == -4.5));
+        app.playing = Some((idx + 1) % app.tracks.len());
+        app.sync_track_gain();
+        assert_eq!(app.fx.track_gain, 0.0);
+        assert!(
+            app.measuring.is_some(),
+            "an unmeasured track starts a measurement"
+        );
+        assert!(matches!(app.normalize_state(), NormalizeState::Measuring));
+        app.set_normalize(false);
+        assert_eq!(app.fx.track_gain, 0.0);
+    }
+    #[test]
+    fn reindex_keeps_selection_and_scroll() {
+        let mut app = app_with("keep", library());
+        app.move_cursor(7);
+        app.offsets = [3, 1, 0];
+        let before = app.view_songs[app.cursor_song];
+        let path = app.tracks[before].path.clone();
+        app.section = Section::Albums;
+        app.move_cursor(2);
+        let album = app.albums[app.view_albums[app.cursor_album]].name.clone();
+        // Rebuild from a copy with one extra track at the front of the order.
+        let mut tracks = library();
+        tracks.push(track("AAA First", "Early", "Opener", 1));
+        tracks.sort_by_cached_key(|t| t.sort_key());
+        app.set_tracks(tracks);
+        assert_eq!(app.tracks[app.view_songs[app.cursor_song]].path, path);
+        assert_eq!(app.albums[app.view_albums[app.cursor_album]].name, album);
+        assert_eq!(app.offsets, [3, 1, 0]);
+        assert_eq!(app.recenter, [false; 3]);
     }
     fn app_with(tag: &str, mut tracks: Vec<Track>) -> App {
         tracks.sort_by_cached_key(|t| t.sort_key());
