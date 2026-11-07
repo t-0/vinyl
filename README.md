@@ -13,7 +13,17 @@ On first run `~/.vinyl` is created with:
 
     music.home = ~/Music
 
-Set `music.home` to the folder holding your music; every audio file at or under it is indexed. The index is cached in `~/.vinyl-index.json` (override with `index.file = ...`) and refreshed on each start, re-reading tags only for files whose size or modification time changed. `VINYL_CONFIG=/path/to/file` points at a different config file.
+Set `music.home` to the folder holding your music; every audio file at or under it is indexed. The index is cached in `~/.vinyl-index.json` (override with `index.file = ...`) and refreshed on each start, re-reading tags only for files whose size or modification time changed. `VINYL_CONFIG=/path/to/file` points at a different config file. `VINYL_AUDIO_BUFFER=4096` asks the output device for a fixed period of that many frames instead of leaving the choice to the audio backend; useful on small devices where the audio thread gets no real-time priority.
+
+### Audio editor
+
+    audio.editor = /Applications/Audacity.app
+    audio.editor.mode = gui
+
+`audio.editor` is the command that `E` runs on the selected track. Write `{file}` where the track path should go (it may appear more than once, and inside a longer argument such as `--in={file}`); if the command has no `{file}`, the path is appended as the last argument. Quote arguments that contain spaces, e.g. `"Logic Pro.app"`. On macOS a `.app` bundle is launched through `open -a`. `audio.editor.mode` says how the editor behaves:
+
+- `gui` (default): the editor is a desktop app. vinyl starts it and carries on playing.
+- `cli`: the editor runs in this terminal. vinyl pauses playback, hands the screen over, waits for the editor to exit, then redraws, resumes playback and refreshes the index so edited tags or lengths show up. Your selection and scroll position are kept.
 
 ### Audio editor
 
@@ -124,3 +134,7 @@ They push 200k random operations through the app state against an 8k-track libra
 - added a preamp (−24 dB to +12 dB) ahead of the FX chain, in the equaliser dialog
 - added auto-normalisation: per-track level measured on first play, cached in the index, added to the preamp
 - flag unknown configuration keys
+
+### v1.7
+
+- audio buffer handling for desktop and device

@@ -8,9 +8,33 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+/// Decoder read-ahead. Decoding runs on the audio callback thread, so every
+/// refill is a read from disk on the thread that must not stall; a bigger
+/// buffer means fewer of them.
+const DECODER_BUFFER: usize = 64 * 1024;
+/// Frames per output period, when `VINYL_AUDIO_BUFFER` asks for a fixed one.
+/// Otherwise the audio backend's default applies. A small device without
+/// real-time scheduling needs more room than a desktop; the player sets this.
+fn buffer_size() -> Option<u32> {
+    std::env::var("VINYL_AUDIO_BUFFER")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
 fn open_output() -> Result<MixerDeviceSink, rodio::DeviceSinkError> {
-    let first = DeviceSinkBuilder::from_default_device()
-        .and_then(|b| b.with_buffer_size(BufferSize::Default).open_stream());
+    // `from_default_device` picks a fixed 50 ms buffer, which CoreAudio
+    // refuses on devices with a smaller maximum (a USB DAC on a Mac allows
+    // 1024 frames); `BufferSize::Default` leaves the period to the backend,
+    // which is what a desktop wants. A player that cannot live with the
+    // backend's default (on ALSA the driver's smallest period) sets
+    // `VINYL_AUDIO_BUFFER` and gets a fixed one.
+    let first = DeviceSinkBuilder::from_default_device().and_then(|b| {
+        let size = match buffer_size() {
+            Some(frames) => BufferSize::Fixed(frames),
+            None => BufferSize::Default,
+        };
+        b.with_buffer_size(size).open_stream()
+    });
     match first {
         Ok(s) => Ok(s),
         Err(_) => DeviceSinkBuilder::open_default_sink(),
@@ -132,7 +156,7 @@ pub fn open_decoder(path: &Path) -> Result<Decoder<BufReader<FileSlice>>> {
     let (file, start, len, note) = locate_audio(path)?;
     let slice = FileSlice::new(file, start, len)?;
     let mut builder = Decoder::builder()
-        .with_data(BufReader::new(slice))
+        .with_data(BufReader::with_capacity(DECODER_BUFFER, slice))
         .with_seekable(true)
         .with_byte_len(len);
     let ext = path.extension().and_then(|e| e.to_str());
