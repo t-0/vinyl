@@ -10,6 +10,9 @@ use anyhow::Result;
 use app::App;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode};
+use std::process::Command;
 use std::time::{Duration, Instant};
 const SEEK_SECS: f64 = 5.0;
 /// How often the whole screen is rewritten cell by cell, so anything a
@@ -83,6 +86,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
                 break;
             }
         }
+        if let Some((name, cmd)) = app.pending_editor.take() {
+            run_editor(&mut app, &name, cmd)?;
+            // The alternate screen is blank again but ratatui's last frame is
+            // not, so make the next frame rewrite every cell.
+            last_repaint = Instant::now() - FULL_REPAINT;
+        }
         if last_tick.elapsed() >= tick {
             app.tick()?;
             last_tick = Instant::now();
@@ -92,6 +101,33 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
             return Ok(());
         }
     }
+}
+/// Runs a terminal audio editor in the foreground: playback is paused, the
+/// screen, raw mode and stderr are handed back to the terminal for the
+/// child's lifetime, then everything is put back and playback resumes.
+fn run_editor(app: &mut App, name: &str, mut cmd: Command) -> Result<()> {
+    let was_playing = app.audio_active();
+    if was_playing && let Some(a) = &app.audio {
+        a.pause();
+    }
+    ratatui::restore();
+    let result = {
+        let _stderr = stderr::suspend();
+        cmd.status()
+    };
+    enable_raw_mode()?;
+    // Not `Terminal::clear`: that asks the terminal where the cursor is and
+    // waits for the answer, which an editor's leftover input can garble.
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        Clear(ClearType::All)
+    )?;
+    if was_playing && let Some(a) = &app.audio {
+        a.resume();
+    }
+    app.editor_finished(name, result);
+    Ok(())
 }
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if app.search_input.is_some() {
@@ -160,6 +196,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('l') => app.toggle_loudness(),
         KeyCode::Char('z') => app.toggle_shuffle(),
         KeyCode::Char('f') => app.reveal_in_finder(),
+        KeyCode::Char('E') => app.edit_in_editor(),
         KeyCode::Char('i') => app.start_index(true),
         _ => {}
     }

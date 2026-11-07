@@ -1,6 +1,6 @@
-use crate::app::{App, EqRow, FxRow, Section, SortKey};
+use crate::app::{App, EqRow, FxRow, NormalizeState, Section, SortKey};
 use crate::config::display_path;
-use crate::fx::{EQ_RANGE_DB, EqMode, Mode, StereoMode, WIDTH_MAX};
+use crate::fx::{EQ_RANGE_DB, EqMode, Mode, PREAMP_MAX_DB, PREAMP_MIN_DB, StereoMode, WIDTH_MAX};
 use crate::spectrum::BANDS;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -395,7 +395,7 @@ fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
     draw_eq_summary(f, rows[15], app);
     draw_spectrum(f, rows[16], app);
     f.render_widget(
-        Paragraph::new(display_path(&t.path)).style(Style::default().fg(DIM)),
+        Paragraph::new(app.config.library_path(&t.path)).style(Style::default().fg(DIM)),
         rows[rows.len() - 1],
     );
 }
@@ -441,6 +441,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(ACCENT),
         ))
     } else {
+        let editor = app.config.audio_editor.is_some();
         let keys = [
             ("/", "Search"),
             ("o", "Sort"),
@@ -462,11 +463,15 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                     "Show File"
                 },
             ),
+            ("E", "Edit"),
             ("i", "Reindex"),
             ("q", "Quit"),
         ];
         let mut spans = Vec::new();
         for (k, d) in keys {
+            if k == "E" && !editor {
+                continue;
+            }
             spans.push(Span::styled(
                 format!(" {k} "),
                 Style::default().fg(Color::Black).bg(Color::Gray),
@@ -633,6 +638,23 @@ fn draw_fx_box(f: &mut Frame, area: Rect, app: &App) {
 fn draw_eq_summary(f: &mut Frame, area: Rect, app: &App) {
     let eq = app.fx.eq;
     let mut spans = vec![Span::styled("EQ      ", Style::default().fg(DIM))];
+    spans.push(Span::styled("Pre ", Style::default().fg(DIM)));
+    spans.push(Span::styled(
+        format!("{:+}dB", app.fx.preamp),
+        Style::default().fg(if app.fx.preamp == 0 { DIM } else { ACCENT }),
+    ));
+    match app.normalize_state() {
+        NormalizeState::Off => {}
+        NormalizeState::Idle => spans.push(Span::styled(" auto", Style::default().fg(ACCENT))),
+        NormalizeState::Measuring => {
+            spans.push(Span::styled(" auto …", Style::default().fg(ACCENT)))
+        }
+        NormalizeState::Gain(g) => spans.push(Span::styled(
+            format!(" auto {g:+.1}"),
+            Style::default().fg(ACCENT),
+        )),
+    }
+    spans.push(Span::styled("  ", Style::default().fg(DIM)));
     match eq.mode {
         EqMode::Off => spans.push(Span::styled("Off", Style::default().fg(DIM))),
         _ => {
@@ -705,6 +727,8 @@ fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
         };
         let label = match row {
+            EqRow::Preamp => "Preamp".to_string(),
+            EqRow::Normalize => "Normalise".to_string(),
             EqRow::Mode => "Mode".to_string(),
             EqRow::Band(b) => eq.band_label(*b),
             EqRow::Loudness => "Loudness".to_string(),
@@ -713,6 +737,46 @@ fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
         };
         let mut spans = vec![Span::styled(format!("{marker}{label:<14}"), lstyle)];
         match row {
+            EqRow::Preamp => {
+                // The range is lopsided (−24..+12), so the 0 dB mark sits at
+                // two thirds and the bar fills away from it either way.
+                let g = app.fx.preamp as i32;
+                let span = (PREAMP_MAX_DB as i32 - PREAMP_MIN_DB as i32) as usize;
+                let zero = ((-PREAMP_MIN_DB as usize) * (bar_w - 1)) / span;
+                let cell = |db: i32| ((db - PREAMP_MIN_DB as i32) as usize * (bar_w - 1)) / span;
+                let (lo, hi) = if g >= 0 {
+                    (zero, cell(g))
+                } else {
+                    (cell(g), zero)
+                };
+                for i in 0..bar_w {
+                    let (ch, st) = if i == zero {
+                        ("┃", Style::default().fg(Color::Gray))
+                    } else if i >= lo && i <= hi && g != 0 {
+                        ("█", Style::default().fg(ACCENT))
+                    } else {
+                        ("░", Style::default().fg(DIM))
+                    };
+                    spans.push(Span::styled(ch, st));
+                }
+                spans.push(Span::raw(format!(" {g:+3} dB")));
+            }
+            EqRow::Normalize => {
+                let on = app.fx.auto_normalize;
+                spans.push(chip(if on { "On" } else { "Off" }, on));
+                let note = match app.normalize_state() {
+                    NormalizeState::Off => "  level each track, added to the preamp".to_string(),
+                    NormalizeState::Idle => "  measured on first play".to_string(),
+                    NormalizeState::Measuring => "  measuring this track…".to_string(),
+                    NormalizeState::Gain(g) => {
+                        format!(
+                            "  this track {g:+.1} dB → preamp {:+.1} dB",
+                            app.fx.effective_preamp_db()
+                        )
+                    }
+                };
+                spans.push(Span::styled(note, Style::default().fg(DIM)));
+            }
             EqRow::Mode => {
                 for m in EqMode::ALL {
                     spans.push(chip(m.label(), m == eq.mode));

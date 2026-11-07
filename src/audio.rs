@@ -1,4 +1,4 @@
-use crate::fx::{Fx, FxParams, SharedParams};
+use crate::fx::{Fx, FxParams, NORMALIZE_RANGE_DB, NORMALIZE_TARGET_DB, SharedParams};
 use crate::spectrum::{SharedTap, Tap};
 use anyhow::{Context, Result};
 use rodio::cpal::BufferSize;
@@ -8,9 +8,33 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+/// Decoder read-ahead. Decoding runs on the audio callback thread, so every
+/// refill is a read from disk on the thread that must not stall; a bigger
+/// buffer means fewer of them.
+const DECODER_BUFFER: usize = 64 * 1024;
+/// Frames per output period, when `VINYL_AUDIO_BUFFER` asks for a fixed one.
+/// Otherwise the audio backend's default applies. A small device without
+/// real-time scheduling needs more room than a desktop; the player sets this.
+fn buffer_size() -> Option<u32> {
+    std::env::var("VINYL_AUDIO_BUFFER")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
 fn open_output() -> Result<MixerDeviceSink, rodio::DeviceSinkError> {
-    let first = DeviceSinkBuilder::from_default_device()
-        .and_then(|b| b.with_buffer_size(BufferSize::Default).open_stream());
+    // `from_default_device` picks a fixed 50 ms buffer, which CoreAudio
+    // refuses on devices with a smaller maximum (a USB DAC on a Mac allows
+    // 1024 frames); `BufferSize::Default` leaves the period to the backend,
+    // which is what a desktop wants. A player that cannot live with the
+    // backend's default (on ALSA the driver's smallest period) sets
+    // `VINYL_AUDIO_BUFFER` and gets a fixed one.
+    let first = DeviceSinkBuilder::from_default_device().and_then(|b| {
+        let size = match buffer_size() {
+            Some(frames) => BufferSize::Fixed(frames),
+            None => BufferSize::Default,
+        };
+        b.with_buffer_size(size).open_stream()
+    });
     match first {
         Ok(s) => Ok(s),
         Err(_) => DeviceSinkBuilder::open_default_sink(),
@@ -132,7 +156,7 @@ pub fn open_decoder(path: &Path) -> Result<Decoder<BufReader<FileSlice>>> {
     let (file, start, len, note) = locate_audio(path)?;
     let slice = FileSlice::new(file, start, len)?;
     let mut builder = Decoder::builder()
-        .with_data(BufReader::new(slice))
+        .with_data(BufReader::with_capacity(DECODER_BUFFER, slice))
         .with_seekable(true)
         .with_byte_len(len);
     let ext = path.extension().and_then(|e| e.to_str());
@@ -142,6 +166,44 @@ pub fn open_decoder(path: &Path) -> Result<Decoder<BufReader<FileSlice>>> {
     builder
         .build()
         .with_context(|| format!("decoding {}", path.display()))
+}
+/// Decodes the whole file and returns the gain in dB that would bring its
+/// level to `NORMALIZE_TARGET_DB`. Level is the RMS over 400 ms blocks,
+/// ignoring blocks quieter than -70 dBFS so silence at the ends and in
+/// pauses does not make a track look quieter than it is.
+pub fn measure_gain(path: &Path) -> Result<f32> {
+    use rodio::Source;
+    let dec = open_decoder(path)?;
+    let block = (dec.sample_rate().get() as usize * dec.channels().get() as usize * 2) / 5;
+    Ok(gain_for(block_levels(dec, block.max(1))))
+}
+/// Mean square of each `block`-sample block.
+fn block_levels(samples: impl Iterator<Item = f32>, block: usize) -> Vec<f32> {
+    let mut levels = Vec::new();
+    let (mut sum, mut n) = (0.0f64, 0usize);
+    for v in samples {
+        sum += (v as f64) * (v as f64);
+        n += 1;
+        if n == block {
+            levels.push((sum / n as f64) as f32);
+            sum = 0.0;
+            n = 0;
+        }
+    }
+    if n > block / 2 {
+        levels.push((sum / n as f64) as f32);
+    }
+    levels
+}
+fn gain_for(levels: Vec<f32>) -> f32 {
+    const GATE: f32 = 1e-7; // -70 dBFS as mean square
+    let loud: Vec<f32> = levels.into_iter().filter(|&m| m > GATE).collect();
+    if loud.is_empty() {
+        return 0.0;
+    }
+    let mean = loud.iter().sum::<f32>() / loud.len() as f32;
+    let level_db = 10.0 * mean.log10();
+    (NORMALIZE_TARGET_DB - level_db).clamp(NORMALIZE_RANGE_DB.0, NORMALIZE_RANGE_DB.1)
 }
 pub fn probe(path: &Path, fx: FxParams) -> Result<String> {
     use rodio::Source;
@@ -171,6 +233,12 @@ pub fn probe(path: &Path, fx: FxParams) -> Result<String> {
         ch,
         dec.total_duration()
     ));
+    match measure_gain(path) {
+        Ok(g) => out.push_str(&format!(
+            "normalise: {g:+.1} dB would bring it to {NORMALIZE_TARGET_DB} dBFS\n"
+        )),
+        Err(e) => out.push_str(&format!("normalise: FAILED: {e:#}\n")),
+    }
     let mut raw = dec;
     let want = sr as usize * ch as usize * 5;
     let mut n = 0usize;
@@ -388,6 +456,12 @@ impl Audio {
     pub fn is_paused(&self) -> bool {
         self.player.is_paused()
     }
+    pub fn pause(&self) {
+        self.player.pause();
+    }
+    pub fn resume(&self) {
+        self.player.play();
+    }
     pub fn finished(&self) -> bool {
         self.player.empty()
     }
@@ -597,6 +671,34 @@ mod tests {
         let dec = open_decoder(&p).unwrap();
         assert_eq!(dec.sample_rate().get(), 8000);
         assert_eq!(dec.count(), 8000);
+    }
+    #[test]
+    fn normalisation_gain_targets_rms_and_ignores_silence() {
+        // -18 dBFS RMS sine: amplitude 0.178; a track already at target needs 0 dB.
+        let amp = 10f32.powf(-18.0 / 20.0) * 2f32.sqrt();
+        let tone: Vec<f32> = (0..44_100 * 4)
+            .map(|i| (i as f32 * 0.05).sin() * amp)
+            .collect();
+        let g = gain_for(block_levels(tone.iter().copied(), 17_640));
+        assert!(g.abs() < 0.2, "at target gave {g:+.2}");
+        // Half the amplitude (-6 dB) wants +6 dB, silence around it ignored.
+        let mut padded = vec![0.0f32; 44_100 * 4];
+        padded.extend(tone.iter().map(|v| v * 0.5));
+        padded.extend(vec![0.0f32; 44_100 * 4]);
+        let g = gain_for(block_levels(padded.iter().copied(), 17_640));
+        assert!((g - 6.0).abs() < 0.2, "quiet gave {g:+.2}");
+        // Very loud is cut, very quiet is boosted, both within range.
+        let g = gain_for(block_levels(tone.iter().map(|v| v * 5.0), 17_640));
+        assert!((g + 14.0).abs() < 0.2, "loud gave {g:+.2}");
+        let g = gain_for(block_levels(tone.iter().map(|v| v * 0.01), 17_640));
+        assert_eq!(g, NORMALIZE_RANGE_DB.1);
+        // Below the gate everything counts as silence: leave it alone.
+        let g = gain_for(block_levels(tone.iter().map(|v| v * 0.001), 17_640));
+        assert_eq!(g, 0.0);
+        assert_eq!(
+            gain_for(block_levels(std::iter::repeat_n(0.0, 100_000), 17_640)),
+            0.0
+        );
     }
     #[test]
     fn open_decoder_reports_missing_file() {
