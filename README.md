@@ -96,3 +96,7 @@ They push 200k random operations through the app state against an 8k-track libra
 ### v1.4
 
 - added tests including soak tests
+
+### v1.5
+- error message leakage - added screen refresh and removing screen pollution (anything the audio stack writes to stderr now lands in `~/.vinyl.log` instead of on the screen)
+- center jumped-to tracks

@@ -157,12 +157,8 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
         Section::Albums => (app.view_albums.len(), app.cursor_album, 1),
         Section::Artists => (app.view_artists.len(), app.cursor_artist, 2),
     };
-    let mut offset = app.offsets[sec].min(len.saturating_sub(1));
-    if cursor < offset {
-        offset = cursor;
-    } else if cursor >= offset + height {
-        offset = cursor + 1 - height;
-    }
+    let recenter = std::mem::take(&mut app.recenter[sec]);
+    let offset = App::scroll_offset(app.offsets[sec], cursor, len, height, recenter);
     app.offsets[sec] = offset;
     let end = (offset + height).min(len);
     let window = offset..end;

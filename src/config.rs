@@ -15,6 +15,12 @@ pub fn config_path() -> Result<PathBuf> {
     }
     Ok(home_dir()?.join(".vinyl"))
 }
+/// Where stderr goes while the UI is on screen (see `stderr.rs`).
+pub fn log_path() -> PathBuf {
+    config_path()
+        .map(|p| p.with_extension("log"))
+        .unwrap_or_else(|_| PathBuf::from("vinyl.log"))
+}
 fn expand_tilde(raw: &str) -> Result<PathBuf> {
     if raw == "~" {
         return home_dir();

@@ -4,12 +4,17 @@ mod config;
 mod fx;
 mod index;
 mod spectrum;
+mod stderr;
 mod ui;
 use anyhow::Result;
 use app::App;
+use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 const SEEK_SECS: f64 = 5.0;
+/// How often the whole screen is rewritten cell by cell, so anything a
+/// library or child process managed to print over the UI gets painted out.
+const FULL_REPAINT: Duration = Duration::from_secs(5);
 fn main() -> Result<()> {
     let config = config::load()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -27,6 +32,10 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // Anything written to stderr while the TUI owns the screen (native audio
+    // libraries, child processes) would land on top of the UI, so send it to
+    // a log file until the terminal is handed back.
+    let _quiet = stderr::Redirect::to_file(&config::log_path());
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, App::new(config));
     ratatui::restore();
@@ -34,9 +43,29 @@ fn main() -> Result<()> {
 }
 fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
     let mut last_tick = Instant::now();
+    let mut last_repaint = Instant::now();
     loop {
         app.update_spectrum();
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        let repaint = last_repaint.elapsed() >= FULL_REPAINT;
+        let mut snapshot = None;
+        terminal.draw(|f| {
+            ui::draw(f, &mut app);
+            if repaint {
+                snapshot = Some(f.buffer_mut().clone());
+            }
+        })?;
+        if let Some(buf) = snapshot {
+            // ratatui only emits cells that changed since the last frame, so
+            // stray text in otherwise static areas would survive forever.
+            // Rewriting every cell (no clear, so no flicker) paints it out.
+            let backend = terminal.backend_mut();
+            backend.draw(buf.content.iter().enumerate().map(|(i, c)| {
+                let (x, y) = buf.pos_of(i);
+                (x, y, c)
+            }))?;
+            backend.flush()?;
+            last_repaint = Instant::now();
+        }
         let tick = if app.audio_active() {
             Duration::from_millis(50)
         } else {

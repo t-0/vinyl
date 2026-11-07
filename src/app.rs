@@ -4,7 +4,7 @@ use crate::fx::{EQ_RANGE_DB, EqMode, FxParams, Mode, StereoMode, WIDTH_MAX};
 use crate::index::{self, IndexMsg, Track};
 use crate::spectrum::Analyser;
 use anyhow::Result;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -61,6 +61,9 @@ pub struct App {
     pub playing: Option<usize>,
     pending_play: Option<usize>,
     pub offsets: [usize; 3],
+    /// Per section: the cursor was moved by a track change rather than by the
+    /// user, so if it landed off screen the list should scroll to centre it.
+    pub recenter: [bool; 3],
     pub speed_pct: i32,
     pub shuffle: bool,
     shuffle_rng: u64,
@@ -120,6 +123,7 @@ impl App {
             playing: None,
             pending_play: None,
             offsets: [0; 3],
+            recenter: [false; 3],
             speed_pct: 0,
             shuffle: false,
             shuffle_rng: SystemTime::now()
@@ -438,6 +442,7 @@ impl App {
             .position(|a| album_idx >= a.album_start && album_idx < a.album_end)
     }
     fn sync_cursors_to(&mut self, track_idx: usize) {
+        self.recenter = [true; 3];
         if let Some(p) = self.song_view_pos(track_idx) {
             self.cursor_song = p;
         } else {
@@ -585,6 +590,7 @@ impl App {
             return;
         }
         *cur = (*cur as i64).saturating_add(delta).clamp(0, len as i64 - 1) as usize;
+        self.recenter[self.section as usize] = false;
     }
     pub fn activate_cursor(&mut self) {
         self.play_cursor();
@@ -807,6 +813,34 @@ impl App {
         let tap = self.audio.as_ref().map(|a| a.tap().clone());
         self.analyser.update(tap.as_ref(), active);
     }
+    /// Scroll offset for a list of `len` rows shown `height` at a time.
+    ///
+    /// Normally the list scrolls just enough to keep the cursor visible. When
+    /// `recenter` is set (the cursor was moved by a track change, e.g. shuffle
+    /// jumping somewhere far away) and the cursor is off screen, the list is
+    /// scrolled so the cursor sits in the middle instead of at an edge.
+    pub fn scroll_offset(
+        offset: usize,
+        cursor: usize,
+        len: usize,
+        height: usize,
+        recenter: bool,
+    ) -> usize {
+        let height = height.max(1);
+        let mut offset = offset.min(len.saturating_sub(1));
+        let visible = cursor >= offset && cursor < offset + height;
+        if recenter && !visible {
+            offset = cursor
+                .saturating_sub(height / 2)
+                .min(len.saturating_sub(height));
+        }
+        if cursor < offset {
+            offset = cursor;
+        } else if cursor >= offset + height {
+            offset = cursor + 1 - height;
+        }
+        offset
+    }
     pub fn tick(&mut self) -> Result<()> {
         self.poll_index();
         if self.pending_play.is_none()
@@ -884,7 +918,7 @@ impl FxRow {
     }
 }
 fn reveal_command(path: &std::path::Path) -> Command {
-    if cfg!(target_os = "macos") {
+    let mut c = if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg("-R").arg(path);
         c
@@ -896,7 +930,12 @@ fn reveal_command(path: &std::path::Path) -> Command {
         let mut c = Command::new("xdg-open");
         c.arg(path.parent().unwrap_or(path));
         c
-    }
+    };
+    // The child would otherwise inherit our terminal and could print over the UI.
+    c.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    c
 }
 fn fx_file(config: &Config) -> std::path::PathBuf {
     config.index_file.with_file_name(".vinyl-fx.json")
@@ -1082,6 +1121,51 @@ mod tests {
             assert_eq!(v, (0..12).collect::<Vec<_>>());
             invariants(&app);
         }
+    }
+    #[test]
+    fn scroll_offset_keeps_cursor_visible_with_minimal_movement() {
+        // cursor already visible: offset unchanged, recenter or not
+        assert_eq!(App::scroll_offset(10, 14, 100, 10, false), 10);
+        assert_eq!(App::scroll_offset(10, 14, 100, 10, true), 10);
+        // user moved one row past the bottom: scroll by one
+        assert_eq!(App::scroll_offset(10, 20, 100, 10, false), 11);
+        // and one row above the top
+        assert_eq!(App::scroll_offset(10, 9, 100, 10, false), 9);
+        // offset beyond the list is pulled back
+        assert_eq!(App::scroll_offset(500, 3, 20, 10, false), 3);
+        // zero height is treated as one row
+        assert_eq!(App::scroll_offset(0, 7, 20, 0, false), 7);
+    }
+    #[test]
+    fn scroll_offset_centres_off_screen_track_changes() {
+        // shuffle jumped far down: cursor lands mid screen
+        assert_eq!(App::scroll_offset(0, 50, 100, 10, true), 45);
+        // and far up
+        assert_eq!(App::scroll_offset(80, 20, 100, 10, true), 15);
+        // just one past the bottom edge is still centred (it was off screen)
+        assert_eq!(App::scroll_offset(10, 20, 100, 10, true), 15);
+        // clamped at the ends of the list
+        assert_eq!(App::scroll_offset(50, 2, 100, 10, true), 0);
+        assert_eq!(App::scroll_offset(0, 98, 100, 10, true), 90);
+        // list shorter than the screen never scrolls
+        assert_eq!(App::scroll_offset(0, 4, 5, 10, true), 0);
+    }
+    #[test]
+    fn track_changes_request_recentre_but_cursor_moves_do_not() {
+        let mut app = app_with("recentre", library());
+        assert_eq!(app.recenter, [false; 3]);
+        app.play_index(5);
+        assert_eq!(app.recenter, [true; 3]);
+        app.recenter = [false; 3];
+        app.toggle_shuffle();
+        app.step_track(1);
+        assert_eq!(app.recenter, [true; 3]);
+        app.section = Section::Songs;
+        app.move_cursor(1);
+        assert_eq!(app.recenter, [false, true, true]);
+        app.section = Section::Albums;
+        app.move_cursor(-1);
+        assert_eq!(app.recenter, [false, false, true]);
     }
     #[test]
     fn step_track_wraps_both_ways() {
