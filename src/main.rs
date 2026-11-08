@@ -2,26 +2,29 @@ mod app;
 mod audio;
 mod config;
 mod fx;
+#[cfg(feature = "gui")]
+mod gui;
 mod index;
+mod keys;
 mod spectrum;
 mod stderr;
+mod tui;
 mod ui;
 use anyhow::Result;
-use app::App;
-use ratatui::backend::Backend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode};
-use std::process::Command;
-use std::time::{Duration, Instant};
-const SEEK_SECS: f64 = 5.0;
-/// How often the whole screen is rewritten cell by cell, so anything a
-/// library or child process managed to print over the UI gets painted out.
-const FULL_REPAINT: Duration = Duration::from_secs(5);
+use config::Ui;
+const USAGE: &str = "usage: vinyl [--gui | --no-gui]
+       vinyl --probe <audio file>
+
+  --gui       open a desktop window instead of running in the terminal
+  --no-gui    run in the terminal (the default unless `ui = gui` is set
+              in ~/.vinyl)
+  --probe     open a file the way playback does and describe it
+  -h, --help  show this help
+";
 fn main() -> Result<()> {
-    let config = config::load()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--probe") {
+        let config = config::load()?;
         let Some(path) = args.get(1) else {
             eprintln!("usage: vinyl --probe <audio file>");
             std::process::exit(2);
@@ -35,218 +38,35 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    // Anything written to stderr while the TUI owns the screen (native audio
-    // libraries, child processes) would land on top of the UI, so send it to
-    // a log file until the terminal is handed back.
-    let _quiet = stderr::Redirect::to_file(&config::log_path());
-    let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(config));
-    ratatui::restore();
-    result
-}
-fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
-    let mut last_tick = Instant::now();
-    let mut last_repaint = Instant::now();
-    loop {
-        app.update_spectrum();
-        let repaint = last_repaint.elapsed() >= FULL_REPAINT;
-        let mut snapshot = None;
-        terminal.draw(|f| {
-            ui::draw(f, &mut app);
-            if repaint {
-                snapshot = Some(f.buffer_mut().clone());
+    let mut ui = None;
+    for arg in &args {
+        match arg.as_str() {
+            "--gui" => ui = Some(Ui::Gui),
+            "--no-gui" | "--tui" => ui = Some(Ui::Tui),
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
             }
-        })?;
-        if let Some(buf) = snapshot {
-            // ratatui only emits cells that changed since the last frame, so
-            // stray text in otherwise static areas would survive forever.
-            // Rewriting every cell (no clear, so no flicker) paints it out.
-            let backend = terminal.backend_mut();
-            backend.draw(buf.content.iter().enumerate().map(|(i, c)| {
-                let (x, y) = buf.pos_of(i);
-                (x, y, c)
-            }))?;
-            backend.flush()?;
-            last_repaint = Instant::now();
-        }
-        let tick = if app.audio_active() {
-            Duration::from_millis(50)
-        } else {
-            Duration::from_millis(200)
-        };
-        let mut wait = tick.saturating_sub(last_tick.elapsed());
-        while event::poll(wait)? {
-            if let Event::Key(key) = event::read()?
-                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            {
-                handle_key(&mut app, key.code, key.modifiers);
-            }
-            wait = Duration::ZERO;
-            if app.should_quit {
-                break;
+            other => {
+                eprintln!("vinyl: unknown option `{other}`\n{USAGE}");
+                std::process::exit(2);
             }
         }
-        if let Some((name, cmd)) = app.pending_editor.take() {
-            run_editor(&mut app, &name, cmd)?;
-            // The alternate screen is blank again but ratatui's last frame is
-            // not, so make the next frame rewrite every cell.
-            last_repaint = Instant::now() - FULL_REPAINT;
-        }
-        if last_tick.elapsed() >= tick {
-            app.tick()?;
-            last_tick = Instant::now();
-        }
-        app.flush_play();
-        if app.should_quit {
-            return Ok(());
-        }
+    }
+    let config = config::load()?;
+    match ui.unwrap_or(config.ui) {
+        Ui::Tui => tui::run(config),
+        Ui::Gui => run_gui(config),
     }
 }
-/// Runs a terminal audio editor in the foreground: playback is paused, the
-/// screen, raw mode and stderr are handed back to the terminal for the
-/// child's lifetime, then everything is put back and playback resumes.
-fn run_editor(app: &mut App, name: &str, mut cmd: Command) -> Result<()> {
-    let was_playing = app.audio_active();
-    if was_playing && let Some(a) = &app.audio {
-        a.pause();
-    }
-    ratatui::restore();
-    let result = {
-        let _stderr = stderr::suspend();
-        cmd.status()
-    };
-    enable_raw_mode()?;
-    // Not `Terminal::clear`: that asks the terminal where the cursor is and
-    // waits for the answer, which an editor's leftover input can garble.
-    execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        Clear(ClearType::All)
-    )?;
-    if was_playing && let Some(a) = &app.audio {
-        a.resume();
-    }
-    app.editor_finished(name, result);
-    Ok(())
+#[cfg(feature = "gui")]
+fn run_gui(config: config::Config) -> Result<()> {
+    gui::run(config)
 }
-fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
-    if app.search_input.is_some() {
-        handle_search_key(app, code, mods);
-        return;
-    }
-    if app.fx_open {
-        handle_fx_key(app, code);
-        return;
-    }
-    if app.eq_open {
-        handle_eq_key(app, code);
-        return;
-    }
-    if app.sort_open {
-        match code {
-            KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => app.sort_open = false,
-            KeyCode::Enter | KeyCode::Char(' ') => app.apply_sort(),
-            KeyCode::Up | KeyCode::Char('k') => app.sort_move(-1),
-            KeyCode::Down | KeyCode::Char('j') => app.sort_move(1),
-            KeyCode::Char('a') => {
-                app.sort_row = 0;
-                app.apply_sort()
-            }
-            KeyCode::Char('t') => {
-                app.sort_row = 1;
-                app.apply_sort()
-            }
-            KeyCode::Char('b') => {
-                app.sort_row = 2;
-                app.apply_sort()
-            }
-            KeyCode::Char('r') => {
-                app.sort_row = 3;
-                app.apply_sort()
-            }
-            _ => {}
-        }
-        return;
-    }
-    match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => app.should_quit = true,
-        KeyCode::Char('s') => app.section = app::Section::Songs,
-        KeyCode::Char('a') => app.section = app::Section::Albums,
-        KeyCode::Char('r') => app.section = app::Section::Artists,
-        KeyCode::Char(' ') => app.toggle_play(),
-        KeyCode::Char('n') => app.step_track(1),
-        KeyCode::Char('p') => app.step_track(-1),
-        KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
-        KeyCode::Home => app.move_cursor(i64::MIN / 2),
-        KeyCode::End => app.move_cursor(i64::MAX / 2),
-        KeyCode::Left | KeyCode::Char(',') => app.seek(-SEEK_SECS),
-        KeyCode::Right | KeyCode::Char('.') => app.seek(SEEK_SECS),
-        KeyCode::Char('=') | KeyCode::Char('+') => app.adjust_speed(1),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_speed(-1),
-        KeyCode::PageUp => app.move_cursor(-(app.page_size as i64)),
-        KeyCode::PageDown => app.move_cursor(app.page_size as i64),
-        KeyCode::Char('0') => app.reset_speed(),
-        KeyCode::Enter => app.activate_cursor(),
-        KeyCode::Char('/') => app.open_search(),
-        KeyCode::Char('x') => app.fx_open = true,
-        KeyCode::Char('e') => app.eq_open = true,
-        KeyCode::Char('o') => app.open_sort(),
-        KeyCode::Char('l') => app.toggle_loudness(),
-        KeyCode::Char('z') => app.toggle_shuffle(),
-        KeyCode::Char('f') => app.reveal_in_finder(),
-        KeyCode::Char('E') => app.edit_in_editor(),
-        KeyCode::Char('i') => app.start_index(true),
-        _ => {}
-    }
-}
-fn handle_search_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
-    let Some(buf) = app.search_input.as_mut() else {
-        return;
-    };
-    match code {
-        KeyCode::Esc => app.cancel_search(),
-        KeyCode::Enter => app.submit_search(),
-        KeyCode::Backspace => {
-            buf.pop();
-        }
-        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => buf.clear(),
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => app.cancel_search(),
-        KeyCode::Char(c) => buf.push(c),
-        _ => {}
-    }
-}
-fn handle_fx_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('x') | KeyCode::Char('q') => app.close_fx(),
-        KeyCode::Up | KeyCode::Char('k') => app.fx_move(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.fx_move(1),
-        KeyCode::Left | KeyCode::Char('h') => app.fx_adjust(-5),
-        KeyCode::Right | KeyCode::Char('l') => app.fx_adjust(5),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.fx_adjust(-1),
-        KeyCode::Char('=') | KeyCode::Char('+') => app.fx_adjust(1),
-        KeyCode::Char(' ') => app.fx_adjust(5),
-        KeyCode::Char('0') => app.fx_reset_row(),
-        _ => {}
-    }
-}
-fn handle_eq_key(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('q') => app.close_eq(),
-        KeyCode::Up | KeyCode::Char('k') => app.eq_move(-1),
-        KeyCode::Down | KeyCode::Char('j') => app.eq_move(1),
-        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') | KeyCode::Char('_') => {
-            app.eq_adjust(-1)
-        }
-        KeyCode::Right
-        | KeyCode::Char('l')
-        | KeyCode::Char('=')
-        | KeyCode::Char('+')
-        | KeyCode::Char(' ') => app.eq_adjust(1),
-        KeyCode::PageUp => app.eq_adjust(3),
-        KeyCode::PageDown => app.eq_adjust(-3),
-        KeyCode::Char('0') => app.eq_reset_row(),
-        _ => {}
-    }
+#[cfg(not(feature = "gui"))]
+fn run_gui(_config: config::Config) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "this vinyl was built without the desktop window; rebuild with \
+         `cargo install --path . --features gui` or run without --gui"
+    ))
 }

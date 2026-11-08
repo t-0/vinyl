@@ -111,6 +111,11 @@ impl App {
         app.start_index(false);
         app
     }
+    /// An app with no audio device and an empty library, for unit tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(config: Config) -> Self {
+        Self::build(config, FxParams::default(), None, None)
+    }
     fn build(
         config: Config,
         fx: FxParams,
@@ -1215,6 +1220,7 @@ fn save_fx(config: &Config, fx: &FxParams) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Ui;
     use std::path::PathBuf;
     use std::time::Instant as TInstant;
     fn temp_config(tag: &str) -> Config {
@@ -1225,6 +1231,7 @@ mod tests {
             index_file: dir.join("index.json"),
             audio_editor: None,
             audio_editor_mode: EditorMode::Gui,
+            ui: Ui::default(),
         }
     }
     fn track(artist: &str, album: &str, title: &str, n: u32) -> Track {

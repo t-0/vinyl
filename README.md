@@ -1,29 +1,32 @@
 # vinyl
 
-A terminal music player. Point it at a folder of audio files and it indexes them (tags via lofty, playback via rodio) and lets you browse by song, album, or artist.
+A music player for the terminal, or for a desktop window that looks just like it. Point it at a folder of audio files and it indexes them (tags via lofty, playback via rodio) and lets you browse by song, album, or artist.
 
 ## Setup
 
     cargo install --path .
-    vinyl
+    vinyl           # in the terminal
+    vinyl --gui     # in a window
 
 Runs on macOS, Linux and Windows. Audio goes through the platform's native API (CoreAudio, ALSA, WASAPI). On Linux the build needs the ALSA headers and pkg-config, e.g. `sudo apt install libasound2-dev pkg-config`. On macOS, if your library lives in `~/Music/Music` or `~/Music/iTunes`, give your terminal app access under System Settings → Privacy & Security → Media & Apple Music.
+
+### Terminal or window
+
+The same player runs either way; `--gui` opens a desktop window (built on [GPUI](https://gpui.rs), Zed's UI framework) with the same layout, colours, dialogs and keys as the terminal version, plus mouse clicks on the tabs and list rows (double-click plays) and scroll-wheel scrolling. `--no-gui` forces the terminal. Without a flag the `ui` setting in `~/.vinyl` decides, and it defaults to the terminal:
+
+    ui = gui
+
+The window is a Cargo feature, `gui`, that is on by default. It pulls in a large GPU and windowing stack, so a terminal-only build is much quicker:
+
+    cargo install --path . --no-default-features
+
+On Linux the window needs a Wayland or X11 session and these development packages at build time (Debian/Ubuntu names): `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev libx11-dev libxcb1-dev`. A `cli` audio editor (see below) cannot take over the window, so when started from the window it runs in whatever terminal vinyl was launched from while playback carries on.
 
 On first run `~/.vinyl` is created with:
 
     music.home = ~/Music
 
 Set `music.home` to the folder holding your music; every audio file at or under it is indexed. The index is cached in `~/.vinyl-index.json` (override with `index.file = ...`) and refreshed on each start, re-reading tags only for files whose size or modification time changed. `VINYL_CONFIG=/path/to/file` points at a different config file. `VINYL_AUDIO_BUFFER=4096` asks the output device for a fixed period of that many frames instead of leaving the choice to the audio backend; useful on small devices where the audio thread gets no real-time priority.
-
-### Audio editor
-
-    audio.editor = /Applications/Audacity.app
-    audio.editor.mode = gui
-
-`audio.editor` is the command that `E` runs on the selected track. Write `{file}` where the track path should go (it may appear more than once, and inside a longer argument such as `--in={file}`); if the command has no `{file}`, the path is appended as the last argument. Quote arguments that contain spaces, e.g. `"Logic Pro.app"`. On macOS a `.app` bundle is launched through `open -a`. `audio.editor.mode` says how the editor behaves:
-
-- `gui` (default): the editor is a desktop app. vinyl starts it and carries on playing.
-- `cli`: the editor runs in this terminal. vinyl pauses playback, hands the screen over, waits for the editor to exit, then redraws, resumes playback and refreshes the index so edited tags or lengths show up. Your selection and scroll position are kept.
 
 ### Audio editor
 
@@ -90,7 +93,7 @@ The Stereo row offers Normal, Mono, and Width. Width uses mid/side processing: t
 
 ## Testing
 
-`cargo test` runs the unit tests: library grouping, search and sort behaviour, shuffle, speed, FX parameter handling, the MP3-in-WAV unwrapping and slice reader, and a guard that the FX chain runs faster than real time in a debug build. None of them touch an audio device.
+`cargo test` runs the unit tests: library grouping, search and sort behaviour, shuffle, speed, FX parameter handling, the key bindings shared by both front ends, the MP3-in-WAV unwrapping and slice reader, and a guard that the FX chain runs faster than real time in a debug build. None of them touch an audio device or open a window; `cargo test --no-default-features` runs the same tests without building the GUI stack.
 
 Longer soak and performance tests are marked `#[ignore]` and are meant for a release build:
 
@@ -138,3 +141,9 @@ They push 200k random operations through the app state against an 8k-track libra
 ### v1.7
 
 - audio buffer handling for desktop and device
+
+### v1.8
+
+- added a desktop window with the same look, dialogs and keys as the terminal UI, built on GPUI: `vinyl --gui`, `--no-gui`, and a `ui = tui|gui` setting
+- key handling is shared by both front ends (`src/keys.rs`); the terminal loop moved to `src/tui.rs`
+- the window is the `gui` Cargo feature (on by default); `--no-default-features` builds the terminal-only player

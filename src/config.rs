@@ -9,6 +9,24 @@ pub struct Config {
     /// program and arguments; the file path is appended when it runs.
     pub audio_editor: Option<Vec<String>>,
     pub audio_editor_mode: EditorMode,
+    /// Which front end starts when neither `--gui` nor `--no-gui` is given.
+    pub ui: Ui,
+}
+/// The front end (`ui`): the terminal UI or a desktop window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Ui {
+    #[default]
+    Tui,
+    Gui,
+}
+impl Ui {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "tui" | "terminal" | "cli" => Ok(Self::Tui),
+            "gui" | "window" | "desktop" => Ok(Self::Gui),
+            other => Err(anyhow!("ui must be `tui` or `gui`, not `{other}`")),
+        }
+    }
 }
 /// How `audio.editor` behaves once launched (`audio.editor.mode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -117,11 +135,12 @@ fn parse_kv(text: &str) -> HashMap<String, String> {
     }
     map
 }
-const KNOWN_KEYS: [&str; 4] = [
+const KNOWN_KEYS: [&str; 5] = [
     "music.home",
     "index.file",
     "audio.editor",
     "audio.editor.mode",
+    "ui",
 ];
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -176,7 +195,11 @@ music.home = ~/Music\n\
 #audio.editor =\n\
 # gui: launch it and keep going. cli: the editor takes over this terminal\n\
 # and vinyl waits for it to finish.\n\
-#audio.editor.mode = gui\n";
+#audio.editor.mode = gui\n\
+\n\
+# tui: run in the terminal (default). gui: open a desktop window.\n\
+# --gui and --no-gui on the command line override this.\n\
+#ui = tui\n";
         fs::write(&path, default)
             .with_context(|| format!("writing default config to {}", path.display()))?;
     }
@@ -214,11 +237,17 @@ music.home = ~/Music\n\
         .map(|s| EditorMode::parse(s))
         .transpose()?
         .unwrap_or_default();
+    let ui = map
+        .get("ui")
+        .map(|s| Ui::parse(s))
+        .transpose()?
+        .unwrap_or_default();
     Ok(Config {
         music_home,
         index_file,
         audio_editor,
         audio_editor_mode,
+        ui,
     })
 }
 impl Config {
@@ -277,6 +306,7 @@ mod tests {
             index_file: PathBuf::from("/m/i.json"),
             audio_editor: None,
             audio_editor_mode: EditorMode::Gui,
+            ui: Ui::default(),
         };
         assert_eq!(
             c.library_path(Path::new("/m/lib/A/B/01 t.mp3")),
