@@ -689,7 +689,7 @@ impl App {
         }
     }
     pub fn adjust_speed(&mut self, delta: i32) {
-        self.speed_pct = (self.speed_pct + delta).clamp(-50, 50);
+        self.speed_pct = (self.speed_pct + delta).clamp(-50, 100);
         let s = self.speed();
         if let Some(a) = &self.audio {
             a.set_speed(s);
@@ -1376,7 +1376,7 @@ mod tests {
         if let Some(p) = app.playing {
             assert!(p < app.tracks.len());
         }
-        assert!((-50..=50).contains(&app.speed_pct));
+        assert!((-50..=100).contains(&app.speed_pct));
     }
     #[test]
     fn library_groups_into_albums_and_artists() {
@@ -1574,7 +1574,7 @@ mod tests {
         assert_eq!(app.speed_pct, 30);
         assert!((app.speed() - 1.3).abs() < 1e-6);
         app.adjust_speed(100);
-        assert_eq!(app.speed_pct, 50);
+        assert_eq!(app.speed_pct, 100);
         app.adjust_speed(-200);
         assert_eq!(app.speed_pct, -50);
         app.reset_speed();

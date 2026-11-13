@@ -138,3 +138,9 @@ They push 200k random operations through the app state against an 8k-track libra
 ### v1.7
 
 - audio buffer handling for desktop and device
+
+## v1.8
+
+- playing/paused text as title of the Now Playing section
+- simplified loudness and stereo indicators
+- speed range extended to 0.5-2.0
