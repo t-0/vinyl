@@ -48,7 +48,7 @@ Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
 | `Enter` | Play the selected song, or the first track of the selected album / artist |
 | `space` | Play / pause (plays the selection if nothing is loaded) |
 | `n` / `p` | Next / previous track |
-| `z` | Toggle shuffle: next and auto-advance pick a random song from the current list, previous walks back through what was played |
+| `z` | Toggle shuffle: next and auto-advance pick a random song from the current list, previous walks back through what was played; remembered across restarts |
 | `←` / `→` (or `,` / `.`) | Rewind / fast-forward 5 seconds |
 | `=` (or `+`) / `-` | Playback speed +1% / −1% (range 50% to 150%) |
 | `0` | Reset speed to 100% |
@@ -139,8 +139,13 @@ They push 200k random operations through the app state against an 8k-track libra
 
 - audio buffer handling for desktop and device
 
-## v1.8
+### v1.8
 
 - playing/paused text as title of the Now Playing section
 - simplified loudness and stereo indicators
 - speed range extended to 0.5-2.0
+
+### v1.9
+
+- speed and shuffle settings are persistent
+- remember last track

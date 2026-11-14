@@ -6,6 +6,8 @@ use crate::fx::{
 use crate::index::{self, IndexMsg, Track};
 use crate::spectrum::Analyser;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -70,6 +72,12 @@ pub struct App {
     pub search_input: Option<String>,
     pub playing: Option<usize>,
     pending_play: Option<usize>,
+    /// Load the pending track paused rather than playing (used when the
+    /// last session's track is restored at startup).
+    start_paused: bool,
+    /// The track that was playing when the app last ran, selected and loaded
+    /// paused once the index has been read; `None` after that.
+    resume_track: Option<PathBuf>,
     pub offsets: [usize; 3],
     /// Per section: the cursor was moved by a track change rather than by the
     /// user, so if it landed off screen the list should scroll to centre it.
@@ -102,12 +110,15 @@ pub struct App {
 }
 impl App {
     pub fn new(config: Config) -> Self {
-        let fx = load_fx(&config);
-        let (audio, audio_error) = match Audio::new(fx) {
+        let settings = load_settings(&config);
+        let (audio, audio_error) = match Audio::new(settings.fx) {
             Ok(a) => (Some(a), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
-        let mut app = Self::build(config, fx, audio, audio_error);
+        let mut app = Self::build(config, settings.fx, audio, audio_error);
+        app.shuffle = settings.shuffle;
+        app.set_speed_pct(settings.speed_pct);
+        app.resume_track = settings.last_track;
         app.start_index(false);
         app
     }
@@ -138,6 +149,8 @@ impl App {
             cursor_artist: 0,
             playing: None,
             pending_play: None,
+            start_paused: false,
+            resume_track: None,
             offsets: [0; 3],
             recenter: [false; 3],
             speed_pct: 0,
@@ -312,6 +325,15 @@ impl App {
         self.apply_search();
         if let Some(keep) = keep {
             self.restore_view(keep);
+        }
+        // First index after startup: pick up where the last session left
+        // off, with the track cued but not playing.
+        if let Some(p) = self.resume_track.take()
+            && self.playing.is_none()
+            && let Some(i) = self.tracks.iter().position(|t| t.path == p)
+        {
+            self.start_paused = true;
+            self.play_index(i);
         }
     }
     fn restore_view(&mut self, keep: ViewState) {
@@ -561,11 +583,13 @@ impl App {
         self.playing = Some(i);
         self.pending_play = Some(i);
         self.sync_cursors_to(i);
+        self.save_settings();
     }
     pub fn flush_play(&mut self) {
         let Some(i) = self.pending_play.take() else {
             return;
         };
+        let paused = std::mem::take(&mut self.start_paused);
         let Some(track) = self.tracks.get(i) else {
             return;
         };
@@ -576,7 +600,12 @@ impl App {
         self.sync_track_gain();
         match self.audio.as_mut() {
             Some(audio) => match audio.load(&path, speed) {
-                Ok(()) => self.status.clear(),
+                Ok(()) => {
+                    if paused {
+                        audio.pause();
+                    }
+                    self.status.clear();
+                }
                 Err(e) => {
                     self.playing = None;
                     let mut msg = format!("cannot play: {e:#}");
@@ -663,6 +692,7 @@ impl App {
         } else {
             "Shuffle off"
         });
+        self.save_settings();
     }
     pub fn move_cursor(&mut self, delta: i64) {
         let (cur, len) = match self.section {
@@ -689,16 +719,18 @@ impl App {
         }
     }
     pub fn adjust_speed(&mut self, delta: i32) {
-        self.speed_pct = (self.speed_pct + delta).clamp(-50, 100);
+        self.set_speed_pct(self.speed_pct + delta);
+        self.save_settings();
+    }
+    pub fn reset_speed(&mut self) {
+        self.set_speed_pct(0);
+        self.save_settings();
+    }
+    fn set_speed_pct(&mut self, pct: i32) {
+        self.speed_pct = pct.clamp(-50, 100);
         let s = self.speed();
         if let Some(a) = &self.audio {
             a.set_speed(s);
-        }
-    }
-    pub fn reset_speed(&mut self) {
-        self.speed_pct = 0;
-        if let Some(a) = &self.audio {
-            a.set_speed(1.0);
         }
     }
     pub fn reveal_in_finder(&mut self) {
@@ -855,8 +887,23 @@ impl App {
         self.fx_open = false;
         self.save_settings();
     }
+    fn settings(&self) -> Settings {
+        // Before the index has loaded nothing is playing yet; keep the track
+        // waiting to be restored rather than forgetting it.
+        let last_track = self
+            .playing
+            .and_then(|i| self.tracks.get(i))
+            .map(|t| t.path.clone())
+            .or_else(|| self.resume_track.clone());
+        Settings {
+            fx: self.fx,
+            shuffle: self.shuffle,
+            speed_pct: self.speed_pct,
+            last_track,
+        }
+    }
     fn save_settings(&mut self) {
-        if let Err(e) = save_fx(&self.config, &self.fx) {
+        if let Err(e) = write_settings(&self.config, &self.settings()) {
             self.set_status(format!("could not save settings: {e:#}"));
         }
     }
@@ -1198,18 +1245,38 @@ fn editor_command(words: &[String], path: &std::path::Path) -> Command {
     }
     c
 }
-fn fx_file(config: &Config) -> std::path::PathBuf {
+/// Everything the user sets while the app runs that should survive a
+/// restart. The FX parameters are flattened so the file keeps the layout
+/// older versions wrote (FX fields at the top level); fields added later
+/// default when missing.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(flatten)]
+    pub fx: FxParams,
+    #[serde(default)]
+    pub shuffle: bool,
+    /// Playback speed as a percentage offset from normal (−50 to +100).
+    #[serde(default)]
+    pub speed_pct: i32,
+    /// Path of the track that was playing, restored (paused) on the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_track: Option<PathBuf>,
+}
+fn settings_file(config: &Config) -> std::path::PathBuf {
     config.index_file.with_file_name(".vinyl-fx.json")
 }
-pub fn load_fx(config: &Config) -> FxParams {
-    std::fs::read_to_string(fx_file(config))
+pub fn load_settings(config: &Config) -> Settings {
+    std::fs::read_to_string(settings_file(config))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
-fn save_fx(config: &Config, fx: &FxParams) -> Result<()> {
-    let json = serde_json::to_string_pretty(fx)?;
-    std::fs::write(fx_file(config), json)?;
+pub fn load_fx(config: &Config) -> FxParams {
+    load_settings(config).fx
+}
+fn write_settings(config: &Config, settings: &Settings) -> Result<()> {
+    let json = serde_json::to_string_pretty(settings)?;
+    std::fs::write(settings_file(config), json)?;
     Ok(())
 }
 #[cfg(test)]
@@ -1556,6 +1623,107 @@ mod tests {
         app.toggle_shuffle();
         assert!(!app.shuffle);
         assert_eq!(app.status, "Shuffle off");
+    }
+    #[test]
+    fn shuffle_is_remembered_across_restarts() {
+        let config = temp_config("shuffle-persist");
+        let mut app = App::build(
+            temp_config("shuffle-persist"),
+            FxParams::default(),
+            None,
+            None,
+        );
+        assert!(!load_settings(&config).shuffle);
+        app.toggle_shuffle();
+        assert!(load_settings(&config).shuffle);
+        assert_eq!(load_settings(&config).fx, FxParams::default());
+        app.toggle_shuffle();
+        assert!(!load_settings(&config).shuffle);
+    }
+    #[test]
+    fn settings_file_without_shuffle_still_loads_fx() {
+        let config = temp_config("settings-compat");
+        let fx = FxParams {
+            preamp: -6,
+            loudness: true,
+            ..FxParams::default()
+        };
+        // The layout older versions wrote: FxParams alone at the top level.
+        std::fs::write(settings_file(&config), serde_json::to_string(&fx).unwrap()).unwrap();
+        let s = load_settings(&config);
+        assert_eq!(s.fx, fx);
+        assert!(!s.shuffle);
+    }
+    #[test]
+    fn last_track_is_remembered_and_restored_paused() {
+        let config = temp_config("last-track");
+        let mut app = app_with("last-track", library());
+        assert_eq!(load_settings(&config).last_track, None);
+        app.play_index(5);
+        app.flush_play();
+        let path = app.tracks[5].path.clone();
+        assert_eq!(load_settings(&config).last_track, Some(path.clone()));
+        // Closing a dialog with nothing playing yet must not forget it.
+        let mut fresh = App::build(temp_config("last-track"), FxParams::default(), None, None);
+        fresh.resume_track = load_settings(&config).last_track;
+        fresh.close_fx();
+        assert_eq!(load_settings(&config).last_track, Some(path.clone()));
+        // The index arrives: the track is cued, paused, with the cursor on it.
+        let mut tracks = library();
+        tracks.sort_by_cached_key(|t| t.sort_key());
+        fresh.set_tracks(tracks);
+        let i = fresh.tracks.iter().position(|t| t.path == path).unwrap();
+        assert_eq!(fresh.playing, Some(i));
+        assert!(fresh.start_paused);
+        assert_eq!(fresh.resume_track, None);
+        assert_eq!(fresh.cursor_track(), Some(i));
+        fresh.flush_play();
+        assert!(!fresh.start_paused);
+        // A re-index later does not restore anything again.
+        fresh.playing = None;
+        let mut tracks = library();
+        tracks.sort_by_cached_key(|t| t.sort_key());
+        fresh.set_tracks(tracks);
+        assert_eq!(fresh.playing, None);
+    }
+    #[test]
+    fn speed_is_remembered_and_clamped_on_restore() {
+        let config = temp_config("speed-persist");
+        let mut app = app_with("speed-persist", library());
+        assert_eq!(load_settings(&config).speed_pct, 0);
+        app.adjust_speed(30);
+        assert_eq!(load_settings(&config).speed_pct, 30);
+        app.reset_speed();
+        assert_eq!(load_settings(&config).speed_pct, 0);
+        app.adjust_speed(-20);
+        assert_eq!(load_settings(&config).speed_pct, -20);
+        // Restoring goes through the same clamp as the keys.
+        let mut fresh = App::build(
+            temp_config("speed-persist"),
+            FxParams::default(),
+            None,
+            None,
+        );
+        fresh.set_speed_pct(load_settings(&config).speed_pct);
+        assert_eq!(fresh.speed_pct, -20);
+        fresh.set_speed_pct(500);
+        assert_eq!(fresh.speed_pct, 100);
+    }
+    #[test]
+    fn missing_last_track_is_ignored() {
+        let mut app = App::build(
+            temp_config("last-track-gone"),
+            FxParams::default(),
+            None,
+            None,
+        );
+        app.resume_track = Some(PathBuf::from("/m/gone/gone/01 gone.mp3"));
+        let mut tracks = library();
+        tracks.sort_by_cached_key(|t| t.sort_key());
+        app.set_tracks(tracks);
+        assert_eq!(app.playing, None);
+        assert!(!app.start_paused);
+        assert_eq!(app.resume_track, None);
     }
     #[test]
     fn shuffle_with_one_visible_track_falls_back_to_linear() {
