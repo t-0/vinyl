@@ -35,7 +35,7 @@ Set `music.home` to the folder holding your music; every audio file at or under 
 - `gui` (default): the editor is a desktop app. vinyl starts it and carries on playing.
 - `cli`: the editor runs in this terminal. vinyl pauses playback, hands the screen over, waits for the editor to exit, then redraws, resumes playback and refreshes the index so edited tags or lengths show up. Your selection and scroll position are kept.
 
-Supported formats: mp3, flac, m4a/aac, ogg/vorbis, opus, wav, aiff.
+Supported formats: mp3, flac, m4a/m4b (aac, alac), ogg/vorbis, wav, aiff.
 
 ## Keys
 
@@ -64,7 +64,7 @@ Speed changes are done by resampling, so pitch shifts with speed.
 
 MP3 files that iTunes or QuickTime wrapped in a RIFF/WAVE header (a WAV file whose payload is MP3 frames) are detected and the MP3 payload is decoded directly.
 
-If a file will not play, `vinyl --probe <file>` opens it the same way playback does and prints the decoder's view of it (format, duration, how much audio the first five seconds yield) or the error.
+`vinyl --version` prints the version and exits. If a file will not play, `vinyl --probe <file>` opens it the same way playback does and prints the decoder's view of it (format, duration, how much audio the first five seconds yield) or the error.
 
 ## Vinyl & tape effects
 
@@ -153,3 +153,10 @@ They push 200k random operations through the app state against an 8k-track libra
 ### v1.0.10
 
 - remap version numbers to sanity
+
+### v1.0.11
+
+- refactor sensibly
+- remove trivial dependencies - dirs and walkdir
+- fix up docs to match formats actually supported
+- added --version

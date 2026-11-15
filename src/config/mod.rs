@@ -1,4 +1,8 @@
+mod editor_mode;
+#[cfg(test)]
+mod tests;
 use anyhow::{Context, Result, anyhow};
+pub use editor_mode::EditorMode;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,27 +13,6 @@ pub struct Config {
     /// program and arguments; the file path is appended when it runs.
     pub audio_editor: Option<Vec<String>>,
     pub audio_editor_mode: EditorMode,
-}
-/// How `audio.editor` behaves once launched (`audio.editor.mode`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum EditorMode {
-    /// The editor is a desktop app: start it and carry on.
-    #[default]
-    Gui,
-    /// The editor runs in this terminal: hand the screen over and wait for it
-    /// to finish before the UI comes back.
-    Cli,
-}
-impl EditorMode {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "gui" => Ok(Self::Gui),
-            "cli" | "tui" | "terminal" => Ok(Self::Cli),
-            other => Err(anyhow!(
-                "audio.editor.mode must be `gui` or `cli`, not `{other}`"
-            )),
-        }
-    }
 }
 /// Splits a command line into words, honouring single and double quotes
 /// and backslash escapes, so `audio.editor = "open -a \"Logic Pro\""` works.
@@ -71,7 +54,7 @@ fn split_command(raw: &str) -> Vec<String> {
     words
 }
 pub fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))
+    std::env::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))
 }
 pub fn config_path() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("VINYL_CONFIG") {
@@ -238,63 +221,4 @@ pub fn display_path(p: &Path) -> String {
         return format!("~/{}", rest.display());
     }
     p.display().to_string()
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn splits_command_words_and_quotes() {
-        assert_eq!(split_command("audacity"), vec!["audacity"]);
-        assert_eq!(
-            split_command("  sox   --flag  x "),
-            vec!["sox", "--flag", "x"]
-        );
-        assert_eq!(
-            split_command(r#"open -a "Logic Pro" 'single q' esc\ aped"#),
-            vec!["open", "-a", "Logic Pro", "single q", "esc aped"]
-        );
-        assert_eq!(split_command(r#"a "" b"#), vec!["a", "", "b"]);
-        assert!(split_command("   ").is_empty());
-    }
-    #[test]
-    fn rejects_unknown_keys_with_a_hint() {
-        let p = Path::new("~/.vinyl");
-        assert!(check_keys(&parse_kv("music.home = ~\naudio.editor = x\n"), p).is_ok());
-        let err = check_keys(&parse_kv("auto.editor.mode = cli\n"), p)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown setting `auto.editor.mode`"), "{err}");
-        assert!(err.contains("did you mean `audio.editor.mode`"), "{err}");
-        let err = check_keys(&parse_kv("zzzzzzzzzzzz = 1\n"), p)
-            .unwrap_err()
-            .to_string();
-        assert!(!err.contains("did you mean"), "{err}");
-    }
-    #[test]
-    fn library_path_strips_music_home() {
-        let c = Config {
-            music_home: PathBuf::from("/m/lib"),
-            index_file: PathBuf::from("/m/i.json"),
-            audio_editor: None,
-            audio_editor_mode: EditorMode::Gui,
-        };
-        assert_eq!(
-            c.library_path(Path::new("/m/lib/A/B/01 t.mp3")),
-            "A/B/01 t.mp3"
-        );
-        assert_eq!(c.library_path(Path::new("/other/x.mp3")), "/other/x.mp3");
-        assert_eq!(c.library_path(Path::new("/m/lib")), "/m/lib");
-    }
-    #[test]
-    fn parses_editor_mode() {
-        assert_eq!(EditorMode::parse("gui").unwrap(), EditorMode::Gui);
-        assert_eq!(EditorMode::parse(" CLI ").unwrap(), EditorMode::Cli);
-        assert!(EditorMode::parse("web").is_err());
-    }
-    #[test]
-    fn config_values_strip_quotes() {
-        let m = parse_kv("audio.editor = \"open -a Audacity\"\naudio.editor.mode='cli'\n# c\n");
-        assert_eq!(m["audio.editor"], "open -a Audacity");
-        assert_eq!(m["audio.editor.mode"], "cli");
-    }
 }

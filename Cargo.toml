@@ -1,14 +1,14 @@
 [package]
 name = "vinyl"
-version = "1.0.10"
+version = "1.0.11"
 edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
-dirs = "7.0.0"
 libc = "0.2"
 lofty = "0.25.5"
 ratatui = "0.30.2"
-rodio = { version = "0.23.0", features = ["symphonia-all"] }
+rodio = { version = "0.23.0", default-features = false, features = [
+    "playback", "flac", "mp3", "mp4", "symphonia-alac", "vorbis", "wav", "symphonia-aiff",
+] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-walkdir = "2.5.0"

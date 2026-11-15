@@ -19,8 +19,12 @@ const SEEK_SECS: f64 = 5.0;
 /// library or child process managed to print over the UI gets painted out.
 const FULL_REPAINT: Duration = Duration::from_secs(5);
 fn main() -> Result<()> {
-    let config = config::load()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("vinyl version {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let config = config::load()?;
     if args.first().map(String::as_str) == Some("--probe") {
         let Some(path) = args.get(1) else {
             eprintln!("usage: vinyl --probe <audio file>");

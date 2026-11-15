@@ -1,65 +1,27 @@
+mod index_msg;
+mod scan;
+#[cfg(test)]
+mod tests;
+mod track;
 use anyhow::{Context, Result};
+pub use index_msg::IndexMsg;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::*;
 use lofty::tag::ItemKey;
+pub use scan::Scan;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::UNIX_EPOCH;
-use walkdir::WalkDir;
+pub use track::Track;
 const AUDIO_EXTS: &[&str] = &[
-    "mp3", "flac", "m4a", "m4b", "aac", "ogg", "oga", "opus", "wav", "wave", "aif", "aiff", "wv",
-    "ape", "mpc",
+    "mp3", "flac", "m4a", "m4b", "aac", "ogg", "oga", "wav", "wave", "aif", "aiff",
 ];
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Track {
-    pub path: PathBuf,
-    pub mtime: u64,
-    pub size: u64,
-    pub artist: String,
-    pub album_artist: Option<String>,
-    pub album: String,
-    pub title: String,
-    pub year: Option<u32>,
-    pub track: Option<u32>,
-    pub disc: Option<u32>,
-    pub duration_secs: f64,
-    pub filetype: String,
-    /// Auto-normalisation gain in dB, measured the first time the track is
-    /// played with normalisation on (see `audio::measure_gain`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gain_db: Option<f32>,
-}
-impl Track {
-    pub fn group_artist(&self) -> &str {
-        self.album_artist
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&self.artist)
-    }
-    pub fn sort_key(&self) -> (String, String, u32, u32, String) {
-        (
-            self.group_artist().to_lowercase(),
-            self.album.to_lowercase(),
-            self.disc.unwrap_or(0),
-            self.track.unwrap_or(0),
-            self.title.to_lowercase(),
-        )
-    }
-}
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Index {
     pub tracks: Vec<Track>,
-}
-pub enum IndexMsg {
-    Progress { done: usize, total: usize },
-    Done(Result<Scan>),
-}
-pub struct Scan {
-    pub tracks: Vec<Track>,
-    pub unreadable: Vec<PathBuf>,
 }
 pub fn is_audio(path: &Path) -> bool {
     path.extension()
@@ -130,12 +92,8 @@ fn read_track(path: &Path, mtime: u64, size: u64) -> Track {
         }
         lofty::file::FileType::Aac => "aac".into(),
         lofty::file::FileType::Vorbis => "ogg".into(),
-        lofty::file::FileType::Opus => "opus".into(),
         lofty::file::FileType::Wav => "wav".into(),
         lofty::file::FileType::Aiff => "aiff".into(),
-        lofty::file::FileType::Ape => "ape".into(),
-        lofty::file::FileType::WavPack => "wv".into(),
-        lofty::file::FileType::Mpc => "mpc".into(),
         _ => ext.clone(),
     };
     if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
@@ -171,6 +129,58 @@ fn read_track(path: &Path, mtime: u64, size: u64) -> Track {
     }
     t
 }
+/// Every audio file under `root`, following symlinks and skipping entries
+/// whose name starts with a dot. A directory reached twice (through a symlink
+/// or a loop) is read once; anything that cannot be read goes in `unreadable`.
+fn walk(root: &Path, files: &mut Vec<PathBuf>, unreadable: &mut Vec<PathBuf>) {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        match fs::canonicalize(&dir) {
+            Ok(real) => {
+                if !seen.insert(real) {
+                    continue;
+                }
+            }
+            Err(_) => {
+                unreadable.push(dir);
+                continue;
+            }
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => {
+                unreadable.push(dir);
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                unreadable.push(dir.clone());
+                continue;
+            };
+            let hidden = entry
+                .file_name()
+                .to_str()
+                .map(|n| n.starts_with('.'))
+                .unwrap_or(false);
+            if hidden {
+                continue;
+            }
+            let path = entry.path();
+            match fs::metadata(&path) {
+                Ok(m) if m.is_dir() => stack.push(path),
+                Ok(m) if m.is_file() => {
+                    if is_audio(&path) {
+                        files.push(path);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => unreadable.push(path),
+            }
+        }
+    }
+}
 pub fn save(index_file: &Path, tracks: &[Track]) -> Result<()> {
     let json = serde_json::to_string(&Index {
         tracks: tracks.to_vec(),
@@ -187,29 +197,7 @@ pub fn build(root: PathBuf, index_file: PathBuf, force: bool, tx: Sender<IndexMs
         };
         let mut unreadable: Vec<PathBuf> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
-        let walker = WalkDir::new(&root)
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|e| {
-                !e.file_name()
-                    .to_str()
-                    .map(|n| n.starts_with('.'))
-                    .unwrap_or(false)
-            });
-        for entry in walker {
-            match entry {
-                Ok(e) => {
-                    if e.file_type().is_file() && is_audio(e.path()) {
-                        files.push(e.into_path());
-                    }
-                }
-                Err(err) => {
-                    if let Some(p) = err.path() {
-                        unreadable.push(p.to_path_buf());
-                    }
-                }
-            }
-        }
+        walk(&root, &mut files, &mut unreadable);
         let total = files.len();
         let _ = tx.send(IndexMsg::Progress { done: 0, total });
         let mut tracks = Vec::with_capacity(total);
