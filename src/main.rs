@@ -4,14 +4,41 @@ mod config;
 mod fx;
 mod index;
 mod spectrum;
+mod stderr;
 mod ui;
 use anyhow::Result;
 use app::App;
+use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode};
+use std::process::Command;
 use std::time::{Duration, Instant};
 const SEEK_SECS: f64 = 5.0;
+/// How often the whole screen is rewritten cell by cell, so anything a
+/// library or child process managed to print over the UI gets painted out.
+const FULL_REPAINT: Duration = Duration::from_secs(5);
 fn main() -> Result<()> {
     let config = config::load()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--probe") {
+        let Some(path) = args.get(1) else {
+            eprintln!("usage: vinyl --probe <audio file>");
+            std::process::exit(2);
+        };
+        match audio::probe(std::path::Path::new(path), app::load_fx(&config)) {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("probe failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+    // Anything written to stderr while the TUI owns the screen (native audio
+    // libraries, child processes) would land on top of the UI, so send it to
+    // a log file until the terminal is handed back.
+    let _quiet = stderr::Redirect::to_file(&config::log_path());
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, App::new(config));
     ratatui::restore();
@@ -19,9 +46,29 @@ fn main() -> Result<()> {
 }
 fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
     let mut last_tick = Instant::now();
+    let mut last_repaint = Instant::now();
     loop {
         app.update_spectrum();
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        let repaint = last_repaint.elapsed() >= FULL_REPAINT;
+        let mut snapshot = None;
+        terminal.draw(|f| {
+            ui::draw(f, &mut app);
+            if repaint {
+                snapshot = Some(f.buffer_mut().clone());
+            }
+        })?;
+        if let Some(buf) = snapshot {
+            // ratatui only emits cells that changed since the last frame, so
+            // stray text in otherwise static areas would survive forever.
+            // Rewriting every cell (no clear, so no flicker) paints it out.
+            let backend = terminal.backend_mut();
+            backend.draw(buf.content.iter().enumerate().map(|(i, c)| {
+                let (x, y) = buf.pos_of(i);
+                (x, y, c)
+            }))?;
+            backend.flush()?;
+            last_repaint = Instant::now();
+        }
         let tick = if app.audio_active() {
             Duration::from_millis(50)
         } else {
@@ -39,6 +86,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
                 break;
             }
         }
+        if let Some((name, cmd)) = app.pending_editor.take() {
+            run_editor(&mut app, &name, cmd)?;
+            // The alternate screen is blank again but ratatui's last frame is
+            // not, so make the next frame rewrite every cell.
+            last_repaint = Instant::now() - FULL_REPAINT;
+        }
         if last_tick.elapsed() >= tick {
             app.tick()?;
             last_tick = Instant::now();
@@ -48,6 +101,33 @@ fn run(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> Result<()> {
             return Ok(());
         }
     }
+}
+/// Runs a terminal audio editor in the foreground: playback is paused, the
+/// screen, raw mode and stderr are handed back to the terminal for the
+/// child's lifetime, then everything is put back and playback resumes.
+fn run_editor(app: &mut App, name: &str, mut cmd: Command) -> Result<()> {
+    let was_playing = app.audio_active();
+    if was_playing && let Some(a) = &app.audio {
+        a.pause();
+    }
+    ratatui::restore();
+    let result = {
+        let _stderr = stderr::suspend();
+        cmd.status()
+    };
+    enable_raw_mode()?;
+    // Not `Terminal::clear`: that asks the terminal where the cursor is and
+    // waits for the answer, which an editor's leftover input can garble.
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        Clear(ClearType::All)
+    )?;
+    if was_playing && let Some(a) = &app.audio {
+        a.resume();
+    }
+    app.editor_finished(name, result);
+    Ok(())
 }
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if app.search_input.is_some() {
@@ -80,6 +160,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.sort_row = 2;
                 app.apply_sort()
             }
+            KeyCode::Char('r') => {
+                app.sort_row = 3;
+                app.apply_sort()
+            }
             _ => {}
         }
         return;
@@ -106,11 +190,13 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('0') => app.reset_speed(),
         KeyCode::Enter => app.activate_cursor(),
         KeyCode::Char('/') => app.open_search(),
-        KeyCode::Char('v') => app.fx_open = true,
+        KeyCode::Char('x') => app.fx_open = true,
         KeyCode::Char('e') => app.eq_open = true,
         KeyCode::Char('o') => app.open_sort(),
         KeyCode::Char('l') => app.toggle_loudness(),
+        KeyCode::Char('z') => app.toggle_shuffle(),
         KeyCode::Char('f') => app.reveal_in_finder(),
+        KeyCode::Char('E') => app.edit_in_editor(),
         KeyCode::Char('i') => app.start_index(true),
         _ => {}
     }
@@ -133,7 +219,7 @@ fn handle_search_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
 }
 fn handle_fx_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('v') | KeyCode::Char('q') => app.close_fx(),
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('x') | KeyCode::Char('q') => app.close_fx(),
         KeyCode::Up | KeyCode::Char('k') => app.fx_move(-1),
         KeyCode::Down | KeyCode::Char('j') => app.fx_move(1),
         KeyCode::Left | KeyCode::Char('h') => app.fx_adjust(-5),

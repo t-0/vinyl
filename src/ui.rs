@@ -1,6 +1,6 @@
-use crate::app::{App, EqRow, FxRow, Section, SortKey};
+use crate::app::{App, EqRow, FxRow, NormalizeState, Section, SortKey};
 use crate::config::display_path;
-use crate::fx::{EQ_RANGE_DB, EqMode, Mode, StereoMode, WIDTH_MAX};
+use crate::fx::{EQ_RANGE_DB, EqMode, Mode, PREAMP_MAX_DB, PREAMP_MIN_DB, StereoMode, WIDTH_MAX};
 use crate::spectrum::BANDS;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -157,12 +157,8 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
         Section::Albums => (app.view_albums.len(), app.cursor_album, 1),
         Section::Artists => (app.view_artists.len(), app.cursor_artist, 2),
     };
-    let mut offset = app.offsets[sec].min(len.saturating_sub(1));
-    if cursor < offset {
-        offset = cursor;
-    } else if cursor >= offset + height {
-        offset = cursor + 1 - height;
-    }
+    let recenter = std::mem::take(&mut app.recenter[sec]);
+    let offset = App::scroll_offset(app.offsets[sec], cursor, len, height, recenter);
     app.offsets[sec] = offset;
     let end = (offset + height).min(len);
     let window = offset..end;
@@ -174,7 +170,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
                 let marker = if Some(i) == playing { "▶ " } else { "  " };
                 let dur = fmt_dur(t.duration_secs);
                 let (left, right) = match app.sort {
-                    SortKey::Artist => (
+                    SortKey::Artist | SortKey::ArtistTrack => (
                         format!("{marker}{} — {}", t.artist, t.title),
                         format!("{}  {dur}", t.album),
                     ),
@@ -278,10 +274,17 @@ fn two_col(left: &str, right: &str, width: usize, highlight: bool) -> Line<'stat
     ])
 }
 fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
+    let playing = app.playing_track();
+    let paused = app.audio.as_ref().map(|a| a.is_paused()).unwrap_or(true);
+    let title = match (playing.is_some(), paused) {
+        (false, _) => " ⏹ Nothing Playing ",
+        (true, true) => " ⏸ Paused ",
+        (true, false) => " ▶ Playing ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DIM))
-        .title(Span::styled(" Now Playing ", Style::default().fg(ACCENT)));
+        .title(Span::styled(title, Style::default().fg(ACCENT).bold()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::default()
@@ -302,26 +305,21 @@ fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .margin(1)
         .split(inner);
-    let Some(t) = app.playing_track() else {
-        f.render_widget(
-            Paragraph::new("Nothing playing.").style(Style::default().fg(DIM)),
-            rows[0],
-        );
+    let Some(t) = playing else {
         f.render_widget(
             Paragraph::new("Select with ↑/↓, press enter to play.").style(Style::default().fg(DIM)),
-            rows[1],
+            rows[0],
         );
         if let Some(err) = &app.audio_error {
             let msg = Rect {
-                x: rows[3].x,
-                y: rows[3].y,
-                width: rows[3].width,
+                x: rows[2].x,
+                y: rows[2].y,
+                width: rows[2].width,
                 height: 4,
             };
             f.render_widget(
@@ -331,25 +329,20 @@ fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
                 msg,
             );
         }
-        draw_speed(f, rows[11], rows[12], app);
+        draw_speed(f, rows[9], rows[10], app);
+        draw_loudness(f, rows[12], app);
+        draw_eq_summary(f, rows[13], app);
         draw_fx_summary(f, rows[14], app);
-        draw_eq_summary(f, rows[15], app);
-        draw_spectrum(f, rows[16], app);
+        draw_spectrum(f, rows[15], app);
         return;
     };
-    let paused = app.audio.as_ref().map(|a| a.is_paused()).unwrap_or(true);
-    let state = if paused { "⏸ paused" } else { "▶ playing" };
-    f.render_widget(
-        Paragraph::new(Span::styled(state, Style::default().fg(ACCENT).bold())),
-        rows[0],
-    );
     let field = |label: &str, value: String| {
         Line::from(vec![
             Span::styled(format!("{label:<8}"), Style::default().fg(DIM)),
             Span::raw(value),
         ])
     };
-    f.render_widget(Paragraph::new(field("Artist", t.artist.clone())), rows[2]);
+    f.render_widget(Paragraph::new(field("Artist", t.artist.clone())), rows[0]);
     f.render_widget(
         Paragraph::new(field(
             "Track",
@@ -359,23 +352,23 @@ fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
             },
         ))
         .style(Style::default().bold()),
-        rows[3],
+        rows[1],
     );
-    f.render_widget(Paragraph::new(field("Album", t.album.clone())), rows[4]);
+    f.render_widget(Paragraph::new(field("Album", t.album.clone())), rows[2]);
     f.render_widget(
         Paragraph::new(field(
             "Year",
             t.year.map(|y| y.to_string()).unwrap_or_else(|| "—".into()),
         )),
-        rows[5],
+        rows[3],
     );
     f.render_widget(
         Paragraph::new(field("Length", fmt_dur(t.duration_secs))),
-        rows[6],
+        rows[4],
     );
     f.render_widget(
         Paragraph::new(field("Type", t.filetype.to_uppercase())),
-        rows[7],
+        rows[5],
     );
     let pos = app
         .audio
@@ -392,14 +385,15 @@ fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
             .gauge_style(Style::default().fg(ACCENT).bg(Color::Rgb(40, 40, 40)))
             .ratio(ratio)
             .label(format!("{} / {}", fmt_dur(pos), fmt_dur(t.duration_secs))),
-        rows[9],
+        rows[7],
     );
-    draw_speed(f, rows[11], rows[12], app);
+    draw_speed(f, rows[9], rows[10], app);
+    draw_loudness(f, rows[12], app);
+    draw_eq_summary(f, rows[13], app);
     draw_fx_summary(f, rows[14], app);
-    draw_eq_summary(f, rows[15], app);
-    draw_spectrum(f, rows[16], app);
+    draw_spectrum(f, rows[15], app);
     f.render_widget(
-        Paragraph::new(display_path(&t.path)).style(Style::default().fg(DIM)),
+        Paragraph::new(app.config.library_path(&t.path)).style(Style::default().fg(DIM)),
         rows[rows.len() - 1],
     );
 }
@@ -407,9 +401,12 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
     let pct = app.speed_pct;
     let label = Line::from(vec![
         Span::styled("Speed   ", Style::default().fg(DIM)),
-        Span::styled(format!("{pct:+}%"), Style::default().fg(ACCENT).bold()),
         Span::styled(
-            format!("  ({:.2}x)   +/- 1%, 0 resets", app.speed()),
+            format!("{}%", 100 + pct),
+            Style::default().fg(ACCENT).bold(),
+        ),
+        Span::styled(
+            format!("  ({:.2}x)   +/- 1%, 0 resets to 100%", app.speed()),
             Style::default().fg(DIM),
         ),
     ]);
@@ -419,9 +416,9 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
         return;
     }
     let track_w = w - 10;
-    let knob = ((pct + 50) as f64 / 100.0 * (track_w - 1) as f64).round() as usize;
-    let center = track_w / 2;
-    let mut spans = vec![Span::styled("-50% ", Style::default().fg(DIM))];
+    let knob = ((pct + 50) as f64 / 150.0 * (track_w - 1) as f64).round() as usize;
+    let center = (50.0 / 150.0 * (track_w - 1) as f64).round() as usize;
+    let mut spans = vec![Span::styled(" 50% ", Style::default().fg(DIM))];
     for i in 0..track_w {
         if i == knob {
             spans.push(Span::styled("●", Style::default().fg(ACCENT).bold()));
@@ -431,7 +428,7 @@ fn draw_speed(f: &mut Frame, label_area: Rect, slider_area: Rect, app: &App) {
             spans.push(Span::styled("─", Style::default().fg(DIM)));
         }
     }
-    spans.push(Span::styled(" +50%", Style::default().fg(DIM)));
+    spans.push(Span::styled(" 200%", Style::default().fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(spans)), slider_area);
 }
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -442,31 +439,37 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(ACCENT),
         ))
     } else {
+        let editor = app.config.audio_editor.is_some();
         let keys = [
-            ("/", "search"),
-            ("o", "sort"),
-            ("v", "vinyl/tape"),
-            ("e", "eq"),
-            ("l", "loudness"),
-            ("↑/↓ pgup/pgdn", "select"),
-            ("⏎", "play"),
-            ("+/-", "speed"),
-            ("space", "play/pause"),
-            ("n/p", "next/prev"),
-            ("←/→", "rew/ff"),
+            ("/", "Search"),
+            ("o", "Sort"),
+            ("x", "FX"),
+            ("e", "EQ"),
+            ("l", "Loudness"),
+            ("↑/↓ pgup/pgdn", "Select"),
+            ("⏎", "Play"),
+            ("+/-", "Speed"),
+            ("space", "Play/Pause"),
+            ("n/p", "Track"),
+            ("z", if app.shuffle { "Shuffle on" } else { "Shuffle" }),
+            ("←/→", "Scan"),
             (
                 "f",
                 if cfg!(target_os = "macos") {
-                    "finder"
+                    "Finder"
                 } else {
-                    "show file"
+                    "Show File"
                 },
             ),
-            ("i", "reindex"),
-            ("q", "quit"),
+            ("E", "Edit"),
+            ("i", "Reindex"),
+            ("q", "Quit"),
         ];
         let mut spans = Vec::new();
         for (k, d) in keys {
+            if k == "E" && !editor {
+                continue;
+            }
             spans.push(Span::styled(
                 format!(" {k} "),
                 Style::default().fg(Color::Black).bg(Color::Gray),
@@ -528,7 +531,7 @@ fn draw_search_box(f: &mut Frame, area: Rect, app: &App) {
 fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
     let p = app.fx;
     let detail = match p.mode {
-        Mode::Off => String::from("Off   (v to configure)"),
+        Mode::Off => String::from("Off"),
         Mode::Vinyl => format!(
             "{}   scratch {}  distortion {}",
             p.mode.label(),
@@ -536,9 +539,10 @@ fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
             p.distortion
         ),
         _ => format!(
-            "{}   age {}  sat {}  wow {}  flt {}",
+            "{}   age {}  hiss {}  sat {}  wow {}  flt {}",
             p.mode.label(),
             p.age,
+            p.hiss,
             p.saturation,
             p.wow,
             p.flutter
@@ -551,7 +555,7 @@ fn draw_fx_summary(f: &mut Frame, area: Rect, app: &App) {
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Effects ", Style::default().fg(DIM)),
+            Span::styled("FX      ", Style::default().fg(DIM)),
             Span::styled(detail, style),
         ])),
         area,
@@ -573,10 +577,7 @@ fn draw_fx_box(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            " Vinyl & Tape ",
-            Style::default().fg(ACCENT).bold(),
-        ));
+        .title(Span::styled(" FX ", Style::default().fg(ACCENT).bold()));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     let mut lines: Vec<Line> = Vec::new();
@@ -632,9 +633,50 @@ fn draw_fx_box(f: &mut Frame, area: Rect, app: &App) {
     ));
     f.render_widget(Paragraph::new(lines), inner);
 }
+fn draw_loudness(f: &mut Frame, area: Rect, app: &App) {
+    let loud = if app.fx.loudness {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let stereo = match app.fx.stereo {
+        StereoMode::Normal => Span::styled("Stereo", Style::default().fg(DIM)),
+        StereoMode::Mono => Span::styled("Mono", Style::default().fg(ACCENT)),
+        StereoMode::Width => Span::styled(
+            format!("Wide {}%", app.fx.width),
+            Style::default().fg(ACCENT),
+        ),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("        "),
+            stereo,
+            Span::raw("  "),
+            Span::styled("Loudness", loud),
+        ])),
+        area,
+    );
+}
 fn draw_eq_summary(f: &mut Frame, area: Rect, app: &App) {
     let eq = app.fx.eq;
     let mut spans = vec![Span::styled("EQ      ", Style::default().fg(DIM))];
+    spans.push(Span::styled("Pre ", Style::default().fg(DIM)));
+    spans.push(Span::styled(
+        format!("{:+}dB", app.fx.preamp),
+        Style::default().fg(if app.fx.preamp == 0 { DIM } else { ACCENT }),
+    ));
+    match app.normalize_state() {
+        NormalizeState::Off => {}
+        NormalizeState::Idle => spans.push(Span::styled(" auto", Style::default().fg(ACCENT))),
+        NormalizeState::Measuring => {
+            spans.push(Span::styled(" auto …", Style::default().fg(ACCENT)))
+        }
+        NormalizeState::Gain(g) => spans.push(Span::styled(
+            format!(" auto {g:+.1}"),
+            Style::default().fg(ACCENT),
+        )),
+    }
+    spans.push(Span::styled("  ", Style::default().fg(DIM)));
     match eq.mode {
         EqMode::Off => spans.push(Span::styled("Off", Style::default().fg(DIM))),
         _ => {
@@ -647,21 +689,6 @@ fn draw_eq_summary(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
     }
-    spans.push(Span::styled("  Loudness ", Style::default().fg(DIM)));
-    spans.push(if app.fx.loudness {
-        Span::styled("On", Style::default().fg(ACCENT))
-    } else {
-        Span::styled("Off", Style::default().fg(DIM))
-    });
-    spans.push(Span::styled("  Stereo ", Style::default().fg(DIM)));
-    spans.push(match app.fx.stereo {
-        StereoMode::Normal => Span::styled("Normal", Style::default().fg(DIM)),
-        StereoMode::Mono => Span::styled("Mono", Style::default().fg(ACCENT)),
-        StereoMode::Width => Span::styled(
-            format!("Width {}%", app.fx.width),
-            Style::default().fg(ACCENT),
-        ),
-    });
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
@@ -707,6 +734,8 @@ fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
         };
         let label = match row {
+            EqRow::Preamp => "Preamp".to_string(),
+            EqRow::Normalize => "Normalise".to_string(),
             EqRow::Mode => "Mode".to_string(),
             EqRow::Band(b) => eq.band_label(*b),
             EqRow::Loudness => "Loudness".to_string(),
@@ -715,6 +744,46 @@ fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
         };
         let mut spans = vec![Span::styled(format!("{marker}{label:<14}"), lstyle)];
         match row {
+            EqRow::Preamp => {
+                // The range is lopsided (−24..+12), so the 0 dB mark sits at
+                // two thirds and the bar fills away from it either way.
+                let g = app.fx.preamp as i32;
+                let span = (PREAMP_MAX_DB as i32 - PREAMP_MIN_DB as i32) as usize;
+                let zero = ((-PREAMP_MIN_DB as usize) * (bar_w - 1)) / span;
+                let cell = |db: i32| ((db - PREAMP_MIN_DB as i32) as usize * (bar_w - 1)) / span;
+                let (lo, hi) = if g >= 0 {
+                    (zero, cell(g))
+                } else {
+                    (cell(g), zero)
+                };
+                for i in 0..bar_w {
+                    let (ch, st) = if i == zero {
+                        ("┃", Style::default().fg(Color::Gray))
+                    } else if i >= lo && i <= hi && g != 0 {
+                        ("█", Style::default().fg(ACCENT))
+                    } else {
+                        ("░", Style::default().fg(DIM))
+                    };
+                    spans.push(Span::styled(ch, st));
+                }
+                spans.push(Span::raw(format!(" {g:+3} dB")));
+            }
+            EqRow::Normalize => {
+                let on = app.fx.auto_normalize;
+                spans.push(chip(if on { "On" } else { "Off" }, on));
+                let note = match app.normalize_state() {
+                    NormalizeState::Off => "  level each track, added to the preamp".to_string(),
+                    NormalizeState::Idle => "  measured on first play".to_string(),
+                    NormalizeState::Measuring => "  measuring this track…".to_string(),
+                    NormalizeState::Gain(g) => {
+                        format!(
+                            "  this track {g:+.1} dB → preamp {:+.1} dB",
+                            app.fx.effective_preamp_db()
+                        )
+                    }
+                };
+                spans.push(Span::styled(note, Style::default().fg(DIM)));
+            }
             EqRow::Mode => {
                 for m in EqMode::ALL {
                     spans.push(chip(m.label(), m == eq.mode));
@@ -787,7 +856,7 @@ fn draw_eq_box(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 fn draw_sort_box(f: &mut Frame, area: Rect, app: &App) {
-    let w = area.width.clamp(30, 56);
+    let w = area.width.clamp(30, 64);
     let h = (SortKey::ALL.len() as u16 + 4).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 3;
@@ -818,7 +887,7 @@ fn draw_sort_box(f: &mut Frame, area: Rect, app: &App) {
             Style::default()
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{:<8}", key.label()), st),
+            Span::styled(format!("{marker}{:<14}", key.label()), st),
             Span::styled(
                 if current { "● " } else { "  " },
                 Style::default().fg(ACCENT),
@@ -828,7 +897,7 @@ fn draw_sort_box(f: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "↑/↓ select  enter apply  a/t/b shortcuts  esc cancel",
+        "↑/↓ select  enter apply  a/t/b/r shortcuts  esc cancel",
         Style::default().fg(DIM),
     ));
     f.render_widget(Paragraph::new(lines), inner);

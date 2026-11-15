@@ -50,6 +50,18 @@ impl EqMode {
     }
 }
 pub const EQ_RANGE_DB: i8 = 12;
+/// Preamp gain range in dB. It sits in front of the whole chain, so a boost
+/// drives the tape saturation and vinyl distortion harder and a cut backs
+/// them off.
+pub const PREAMP_MIN_DB: i8 = -24;
+pub const PREAMP_MAX_DB: i8 = 12;
+/// Where auto-normalisation tries to put a track's gated RMS level, in dBFS,
+/// and how far it is allowed to move a track to get there.
+pub const NORMALIZE_TARGET_DB: f32 = -18.0;
+pub const NORMALIZE_RANGE_DB: (f32, f32) = (-18.0, 12.0);
+/// Time constant of the ramp between preamp gains, so a measurement that
+/// arrives mid-track fades in rather than steps.
+const GAIN_RAMP_SECS: f32 = 0.3;
 pub const THREE_BANDS: [(&str, f32); 3] = [("Low", 200.0), ("Mid", 1000.0), ("High", 4000.0)];
 pub const SEVEN_BANDS: [f32; 7] = [60.0, 150.0, 400.0, 1000.0, 2500.0, 6000.0, 15000.0];
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
@@ -112,7 +124,10 @@ pub const WIDTH_MAX: u8 = 200;
 fn default_width() -> u8 {
     150
 }
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+fn default_hiss() -> u8 {
+    50
+}
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct FxParams {
     pub mode: Mode,
     pub scratch: u8,
@@ -121,6 +136,18 @@ pub struct FxParams {
     pub saturation: u8,
     pub wow: u8,
     pub flutter: u8,
+    #[serde(default = "default_hiss")]
+    pub hiss: u8,
+    /// Gain in dB applied before everything else.
+    #[serde(default)]
+    pub preamp: i8,
+    /// Add each track's measured normalisation gain to the preamp.
+    #[serde(default)]
+    pub auto_normalize: bool,
+    /// Normalisation gain for the current track in dB, set by the app per
+    /// track; it is state, not a setting, so it is never saved.
+    #[serde(skip)]
+    pub track_gain: f32,
     #[serde(default)]
     pub eq: EqParams,
     #[serde(default)]
@@ -129,6 +156,22 @@ pub struct FxParams {
     pub stereo: StereoMode,
     #[serde(default = "default_width")]
     pub width: u8,
+}
+impl FxParams {
+    /// User preamp plus the track's normalisation gain when that is on, in dB.
+    pub fn effective_preamp_db(&self) -> f32 {
+        let user = self.preamp.clamp(PREAMP_MIN_DB, PREAMP_MAX_DB) as f32;
+        if self.auto_normalize {
+            user + self
+                .track_gain
+                .clamp(NORMALIZE_RANGE_DB.0, NORMALIZE_RANGE_DB.1)
+        } else {
+            user
+        }
+    }
+    fn preamp_linear(&self) -> f32 {
+        10f32.powf(self.effective_preamp_db() / 20.0)
+    }
 }
 impl Default for FxParams {
     fn default() -> Self {
@@ -140,6 +183,10 @@ impl Default for FxParams {
             saturation: 35,
             wow: 20,
             flutter: 15,
+            hiss: default_hiss(),
+            preamp: 0,
+            auto_normalize: false,
+            track_gain: 0.0,
             eq: EqParams::default(),
             loudness: false,
             stereo: StereoMode::Normal,
@@ -270,6 +317,8 @@ fn soft_limit(y: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Derived {
     mode: Mode,
+    /// Linear preamp gain; 1.0 is 0 dB.
+    preamp: f32,
     drive: f32,
     bias: f32,
     makeup: f32,
@@ -301,6 +350,9 @@ pub struct Fx<S: Source> {
     frame_delay: f32,
     frame_pop: f32,
     frame_gain: f32,
+    /// Current preamp gain, ramping toward `d.preamp`.
+    gain: f32,
+    gain_coef: f32,
     pop_env: f32,
     pop_decay: f32,
     lfo: [f32; 4],
@@ -324,6 +376,7 @@ impl<S: Source> Fx<S> {
                 loud: [Biquad::default(); 2],
             })
             .collect();
+        let gain = params.lock().map(|p| p.preamp_linear()).unwrap_or(1.0);
         let mut fx = Self {
             inner,
             params,
@@ -340,6 +393,8 @@ impl<S: Source> Fx<S> {
             frame_delay: BASE_DELAY_SECS,
             frame_pop: 0.0,
             frame_gain: 1.0,
+            gain,
+            gain_coef: 1.0 - (-1.0 / (sr * GAIN_RAMP_SECS)).exp(),
             pop_env: 0.0,
             pop_decay: (-1.0 / (sr * 0.0012)).exp(),
             lfo: [0.0; 4],
@@ -396,7 +451,7 @@ impl<S: Source> Fx<S> {
                 d.drive = 1.0 + 5.0 * sat;
                 d.makeup = 1.0 / d.drive.powf(0.65);
                 let base_hiss = if cassette { 0.0035 } else { 0.0010 };
-                d.hiss = base_hiss * (1.0 + 3.0 * age);
+                d.hiss = base_hiss * 2.0 * pct(p.hiss) * (1.0 + 3.0 * age);
                 let wf_scale = if cassette { 1.5 } else { 0.6 };
                 d.wow_depth = (0.005 * pct(p.wow) + 0.0008 * age) * wf_scale;
                 d.flutter_depth = 0.00024 * pct(p.flutter) * wf_scale;
@@ -406,6 +461,7 @@ impl<S: Source> Fx<S> {
                 d.cutoff = base_cut * (1.0 - 0.6 * age);
             }
         }
+        d.preamp = p.preamp_linear();
         let rate_scale = 44_100.0 / self.sr;
         d.pop_prob *= rate_scale;
         d.dropout_prob *= rate_scale;
@@ -441,6 +497,12 @@ impl<S: Source> Fx<S> {
     }
     fn advance_frame(&mut self) {
         let d = self.d;
+        if self.gain != d.preamp {
+            self.gain += (d.preamp - self.gain) * self.gain_coef;
+            if (d.preamp - self.gain).abs() < 1e-4 {
+                self.gain = d.preamp;
+            }
+        }
         let dt = 1.0 / self.sr;
         let two_pi = 2.0 * std::f32::consts::PI;
         if d.mode.is_tape() {
@@ -485,10 +547,12 @@ impl<S: Source> Fx<S> {
     fn process(&mut self, x: Sample, ch: usize) -> Sample {
         let d = self.d;
         let shape = d.eq_bands > 0 || d.loudness;
-        if d.mode == Mode::Off && !shape {
+        let gain = self.gain;
+        let boost = gain > 1.0;
+        if d.mode == Mode::Off && !shape && gain == 1.0 {
             return x;
         }
-        let mut y = x;
+        let mut y = x * gain;
         let sr = self.sr;
         let c = &mut self.chans[ch];
         if d.mode == Mode::Off {
@@ -524,6 +588,8 @@ impl<S: Source> Fx<S> {
                 let bass = c.loud[0].process(y * 0.75);
                 y = c.loud[1].process(bass);
             }
+        }
+        if shape || boost {
             y = soft_limit(y);
         }
         y
@@ -616,6 +682,254 @@ mod tests {
         let shared = Arc::new(Mutex::new(params));
         Fx::new(src, shared, None).collect()
     }
+    fn run_signal(params: FxParams, data: Vec<f32>, sr: u32) -> Vec<f32> {
+        let src = SamplesBuffer::new(NonZero::new(2).unwrap(), NonZero::new(sr).unwrap(), data);
+        Fx::new(src, Arc::new(Mutex::new(params)), None).collect()
+    }
+    fn rms(v: &[f32]) -> f32 {
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
+    }
+    fn clean_tape(mode: Mode, hiss: u8) -> FxParams {
+        FxParams {
+            mode,
+            age: 0,
+            saturation: 0,
+            wow: 0,
+            flutter: 0,
+            hiss,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn hiss_parameter_scales_tape_noise() {
+        for mode in [Mode::ReelToReel, Mode::Cassette] {
+            let silence = vec![0.0f32; 44_100 * 2];
+            let quiet = run_signal(clean_tape(mode, 0), silence.clone(), 44_100);
+            let mid = run_signal(clean_tape(mode, 50), silence.clone(), 44_100);
+            let loud = run_signal(clean_tape(mode, 100), silence, 44_100);
+            let (q, m, l) = (rms(&quiet), rms(&mid), rms(&loud));
+            assert!(q < 1e-6, "{mode:?}: hiss 0 should be silent, rms {q}");
+            assert!(m > 1e-4, "{mode:?}: hiss 50 should be audible, rms {m}");
+            let ratio = l / m;
+            assert!(
+                (1.6..2.4).contains(&ratio),
+                "{mode:?}: hiss 100 should be about twice hiss 50, got {ratio}"
+            );
+        }
+    }
+    #[test]
+    fn cassette_hisses_more_than_reel_at_same_setting() {
+        let silence = vec![0.0f32; 44_100 * 2];
+        let reel = rms(&run_signal(
+            clean_tape(Mode::ReelToReel, 50),
+            silence.clone(),
+            44_100,
+        ));
+        let cass = rms(&run_signal(clean_tape(Mode::Cassette, 50), silence, 44_100));
+        assert!(cass > reel * 2.0, "cassette {cass} vs reel {reel}");
+    }
+    #[test]
+    fn age_still_raises_hiss() {
+        let silence = vec![0.0f32; 44_100 * 2];
+        let young = rms(&run_signal(
+            clean_tape(Mode::ReelToReel, 50),
+            silence.clone(),
+            44_100,
+        ));
+        let old = rms(&run_signal(
+            FxParams {
+                age: 100,
+                ..clean_tape(Mode::ReelToReel, 50)
+            },
+            silence,
+            44_100,
+        ));
+        assert!(old > young * 2.0, "old {old} vs young {young}");
+    }
+    #[test]
+    fn legacy_settings_without_hiss_load_at_default() {
+        let json = r#"{"mode":"Cassette","scratch":30,"distortion":15,"age":25,"saturation":35,"wow":20,"flutter":15}"#;
+        let p: FxParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.hiss, FxParams::default().hiss);
+        assert_eq!(p.mode, Mode::Cassette);
+        let round: FxParams = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(round, p);
+    }
+    #[test]
+    fn vinyl_scratch_zero_is_free_of_noise_and_pops() {
+        let silence = vec![0.0f32; 44_100 * 2];
+        let out = run_signal(
+            FxParams {
+                mode: Mode::Vinyl,
+                scratch: 0,
+                distortion: 0,
+                ..Default::default()
+            },
+            silence,
+            44_100,
+        );
+        assert!(rms(&out) < 1e-6);
+    }
+    #[test]
+    fn mono_input_is_supported() {
+        let data = sine(22_050);
+        let src = SamplesBuffer::new(
+            NonZero::new(1).unwrap(),
+            NonZero::new(22_050).unwrap(),
+            data,
+        );
+        let p = FxParams {
+            mode: Mode::Cassette,
+            ..Default::default()
+        };
+        let out: Vec<f32> = Fx::new(src, Arc::new(Mutex::new(p)), None).collect();
+        assert_eq!(out.len(), 22_050);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+    #[test]
+    fn parameter_changes_apply_while_streaming() {
+        let shared = Arc::new(Mutex::new(FxParams {
+            mode: Mode::Off,
+            ..Default::default()
+        }));
+        let data = vec![0.0f32; 44_100 * 2];
+        let src = SamplesBuffer::new(
+            NonZero::new(2).unwrap(),
+            NonZero::new(44_100).unwrap(),
+            data,
+        );
+        let mut fx = Fx::new(src, shared.clone(), None);
+        let first: Vec<f32> = fx.by_ref().take(44_100).collect();
+        assert!(rms(&first) < 1e-6);
+        shared.lock().unwrap().mode = Mode::Cassette;
+        shared.lock().unwrap().hiss = 100;
+        let rest: Vec<f32> = fx.collect();
+        assert!(
+            rms(&rest[4096..]) > 1e-4,
+            "hiss should appear after the switch"
+        );
+    }
+    #[test]
+    fn fx_chain_runs_faster_than_realtime() {
+        let secs = 20;
+        let data = sine(44_100 * 2 * secs);
+        for mode in [Mode::Vinyl, Mode::ReelToReel, Mode::Cassette] {
+            let p = FxParams {
+                mode,
+                eq: EqParams {
+                    mode: EqMode::Seven,
+                    ..Default::default()
+                },
+                loudness: true,
+                stereo: StereoMode::Width,
+                ..Default::default()
+            };
+            let src = SamplesBuffer::new(
+                NonZero::new(2).unwrap(),
+                NonZero::new(44_100).unwrap(),
+                data.clone(),
+            );
+            let t = std::time::Instant::now();
+            let n = Fx::new(src, Arc::new(Mutex::new(p)), None).fold(0usize, |n, v| {
+                assert!(v.is_finite());
+                n + 1
+            });
+            let el = t.elapsed().as_secs_f64();
+            assert_eq!(n, data.len());
+            eprintln!(
+                "fx {mode:?}: {secs}s of audio in {el:.3}s ({:.1}x realtime)",
+                secs as f64 / el
+            );
+            assert!(
+                el < secs as f64 / 3.0,
+                "{mode:?} ran at under 3x realtime: {el:.2}s"
+            );
+        }
+    }
+    #[test]
+    #[ignore]
+    fn soak_fx_hour_with_random_parameter_changes() {
+        let sr = 44_100u32;
+        let secs = 3600usize;
+        let shared = Arc::new(Mutex::new(FxParams::default()));
+        let block = sine(sr as usize * 2);
+        let data = block.iter().copied().cycle().take(sr as usize * 2 * secs);
+        struct Cycle<I: Iterator<Item = f32>>(I);
+        impl<I: Iterator<Item = f32>> Iterator for Cycle<I> {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> {
+                self.0.next()
+            }
+        }
+        impl<I: Iterator<Item = f32>> Source for Cycle<I> {
+            fn current_span_len(&self) -> Option<usize> {
+                None
+            }
+            fn channels(&self) -> ChannelCount {
+                NonZero::new(2).unwrap()
+            }
+            fn sample_rate(&self) -> SampleRate {
+                NonZero::new(44_100).unwrap()
+            }
+            fn total_duration(&self) -> Option<Duration> {
+                None
+            }
+        }
+        let mut fx = Fx::new(Cycle(data), shared.clone(), None);
+        let mut rng = 0x5eed_1234u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let half_second = sr as usize;
+        let t = std::time::Instant::now();
+        let mut peak = 0f32;
+        let mut total = 0usize;
+        for _ in 0..secs * 2 {
+            {
+                let mut p = shared.lock().unwrap();
+                p.mode = Mode::ALL[(next() % Mode::ALL.len() as u64) as usize];
+                p.scratch = (next() % 101) as u8;
+                p.distortion = (next() % 101) as u8;
+                p.age = (next() % 101) as u8;
+                p.saturation = (next() % 101) as u8;
+                p.wow = (next() % 101) as u8;
+                p.flutter = (next() % 101) as u8;
+                p.hiss = (next() % 101) as u8;
+                p.preamp = (next() % 37) as i8 + PREAMP_MIN_DB;
+                p.auto_normalize = next() % 2 == 0;
+                p.track_gain = (next() % 400) as f32 / 10.0 - 24.0;
+                p.loudness = next() % 2 == 0;
+                p.eq.mode = match next() % 3 {
+                    0 => EqMode::Off,
+                    1 => EqMode::Three,
+                    _ => EqMode::Seven,
+                };
+                for b in p.eq.seven.iter_mut() {
+                    *b = (next() % 25) as i8 - 12;
+                }
+                for b in p.eq.three.iter_mut() {
+                    *b = (next() % 25) as i8 - 12;
+                }
+                p.stereo = StereoMode::ALL[(next() % 3) as usize];
+                p.width = (next() % (WIDTH_MAX as u64 + 1)) as u8;
+            }
+            for v in fx.by_ref().take(half_second) {
+                assert!(v.is_finite(), "non-finite sample after {total} samples");
+                peak = peak.max(v.abs());
+                total += 1;
+            }
+        }
+        let el = t.elapsed().as_secs_f64();
+        eprintln!(
+            "soak fx: {secs}s processed in {el:.1}s ({:.1}x realtime), peak {peak:.3}",
+            secs as f64 / el
+        );
+        assert_eq!(total, sr as usize * 2 * secs);
+        assert!(peak < 2.0, "peak {peak}");
+    }
     #[test]
     fn off_is_identity() {
         let out = run(FxParams {
@@ -623,6 +937,111 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(out, sine(44_100));
+    }
+    #[test]
+    fn preamp_scales_the_signal_before_the_chain() {
+        let clean = run(FxParams::default());
+        let quiet = run(FxParams {
+            preamp: -6,
+            ..Default::default()
+        });
+        let ratio = rms(&quiet) / rms(&clean);
+        assert!((ratio - 0.501).abs() < 0.01, "-6 dB gave ratio {ratio}");
+        let loud = run(FxParams {
+            preamp: 12,
+            ..Default::default()
+        });
+        let peak = loud.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            peak <= 1.0 && peak > 0.9,
+            "+12 dB peak {peak} should be limited"
+        );
+        // A boost into tape saturation changes the shape, not just the level.
+        let tape = |pre| {
+            run(FxParams {
+                mode: Mode::ReelToReel,
+                hiss: 0,
+                wow: 0,
+                flutter: 0,
+                age: 0,
+                preamp: pre,
+                ..Default::default()
+            })
+        };
+        let (a, b) = (tape(0), tape(12));
+        let (ra, rb) = (rms(&a), rms(&b));
+        assert!(rb > ra, "boost should be louder: {ra} vs {rb}");
+        assert!(
+            rb / ra < 3.98,
+            "saturation should compress a +12 dB boost: {}",
+            rb / ra
+        );
+        let muted = run(FxParams {
+            preamp: PREAMP_MIN_DB,
+            ..Default::default()
+        });
+        let ratio = rms(&muted) / rms(&clean);
+        assert!((ratio - 0.063).abs() < 0.005, "-24 dB gave ratio {ratio}");
+    }
+    #[test]
+    fn normalisation_adds_to_preamp_and_ramps() {
+        let p = FxParams {
+            preamp: 6,
+            auto_normalize: true,
+            track_gain: -12.0,
+            ..Default::default()
+        };
+        assert_eq!(p.effective_preamp_db(), -6.0);
+        assert_eq!(
+            FxParams {
+                auto_normalize: false,
+                ..p
+            }
+            .effective_preamp_db(),
+            6.0
+        );
+        assert_eq!(
+            FxParams {
+                track_gain: 40.0,
+                ..p
+            }
+            .effective_preamp_db(),
+            6.0 + NORMALIZE_RANGE_DB.1
+        );
+        // A gain that changes while streaming fades over a fraction of a
+        // second instead of stepping.
+        let shared = Arc::new(Mutex::new(FxParams {
+            auto_normalize: true,
+            ..Default::default()
+        }));
+        let data = vec![0.5f32; 44_100 * 2 * 3];
+        let src = SamplesBuffer::new(
+            NonZero::new(2).unwrap(),
+            NonZero::new(44_100).unwrap(),
+            data,
+        );
+        let mut fx = Fx::new(src, shared.clone(), None);
+        let first: Vec<f32> = fx.by_ref().take(2000).collect();
+        assert!(first.iter().all(|&v| v == 0.5));
+        shared.lock().unwrap().track_gain = -6.0;
+        let rest: Vec<f32> = fx.collect();
+        let at = |ms: usize| rest[ms * 44_100 * 2 / 1000 + 512];
+        assert!(
+            at(5) < 0.5 && at(5) > 0.45,
+            "ramp should have started: {}",
+            at(5)
+        );
+        assert!(at(100) > at(300), "ramp should keep falling");
+        let last = *rest.last().unwrap();
+        assert!(
+            (last - 0.2505).abs() < 0.002,
+            "should settle at -6 dB: {last}"
+        );
+        let steps = rest
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(steps < 0.002, "largest step {steps} is a click");
     }
     #[test]
     fn modes_stay_finite_and_bounded() {
